@@ -25,12 +25,13 @@ participantes, el control de cobros, la asistencia.
 - **Control de versiones:** Git y GitHub
 
 ## Estructura del Proyecto
-
+```bash
 Creete-el-cuento/
 ── src/              # Código fuente
 ├── db/               # Base de datos
 ├── docs/             # Documentación
 └── README.md         # Este archivo
+```
 
 ## Equipo de Desarrollo
 
