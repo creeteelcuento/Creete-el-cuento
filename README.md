@@ -26,11 +26,11 @@ participantes, el control de cobros, la asistencia.
 
 ## Estructura del Proyecto
 
+```bash
 Creete-el-cuento/
-── src/              # Código fuente
-├── db/               # Base de datos
-├── docs/             # Documentación
-└── README.md         # Este archivo
+├── src/
+├── db/
+└── README.md
 
 ## Equipo de Desarrollo
 
