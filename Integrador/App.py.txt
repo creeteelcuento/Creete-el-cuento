@@ -1,0 +1,95 @@
+import streamlit as st
+import pandas as pd
+from datetime import datetime, timedelta
+
+# Configuración de la página
+st.set_page_config(page_title="Créate el Cuento", layout="wide")
+
+# Estilos personalizados
+st.markdown("""
+    <style>
+    .main {background-color: #fffbea;}
+    h1, h2, h3 {color: #ffb300;}
+    .stButton>button {
+        background-color: #ffcc00;
+        color: black;
+        font-weight: bold;
+        border: 2px solid black;
+        border-radius: 5px;
+    }
+    .sidebar .sidebar-content {
+        background-color: #fff9d6;
+        color: black;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# --- Menú lateral ---
+menu = st.sidebar.radio("Menú", ["Panel general", "Participantes", "Membresías y pagos"])
+
+# --- Panel general ---
+if menu == "Panel general":
+    st.title("📊 Panel general")
+
+    # KPIs simulados
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Participantes activas", "128")
+    col2.metric("Por vencer (10 días)", "14")
+    col3.metric("Asistencia promedio", "86%")
+    col4.metric("Becas activas / revocadas", "22 / 3")
+    col5.metric("Ingresos del mes", "$250.000")
+
+    # Gráfico de ingresos
+    st.subheader("Ingresos por membresías")
+    df = pd.DataFrame({
+        "Mes": ["Abr", "May", "Jun", "Jul", "Ago", "Sep"],
+        "Ingresos": [50000, 70000, 90000, 120000, 150000, 250000]
+    })
+    st.bar_chart(df.set_index("Mes"))
+
+    # Membresías por vencer
+    st.subheader("Membresías por vencer")
+    vencimientos = pd.DataFrame({
+        "Participante": ["A", "B", "C", "D"],
+        "Días restantes": [3, 8, 10, 21]
+    })
+    st.table(vencimientos)
+    st.button("Enviar recordatorio")
+
+# --- Participantes ---
+elif menu == "Participantes":
+    st.title("👩‍💼 Registro de participantes")
+
+    nombre = st.text_input("Nombre completo")
+    correo = st.text_input("Correo electrónico")
+    telefono = st.text_input("Teléfono")
+    rol = st.selectbox("Rol", ["Mentora", "Emprendedora", "Becada"])
+    descripcion = st.text_area("Descripción profesional")
+
+    if st.button("Guardar participante"):
+        st.success(f"✅ {nombre} registrado como {rol}")
+
+    st.subheader("Clasificación y siguiente paso")
+    st.write("- **Mentora**: Validación de perfil por la coordinadora")
+    st.write("- **Emprendedora**: Pago directo de membresía")
+    st.write("- **Becada**: Evaluación de beca")
+
+# --- Membresías y pagos ---
+elif menu == "Membresías y pagos":
+    st.title("💰 Membresías y pagos")
+
+    # Tabla de ejemplo
+    data = {
+        "Participante": ["A", "B", "C", "D"],
+        "Inicio": ["05/04", "12/05", "01/02", "—"],
+        "Vencimiento": ["05/10", "12/11", "01/08", "—"],
+        "Estado": ["Por vencer", "Pagado", "Vencido", "Becado"],
+        "Comprobante": ["Ver archivo", "Ver archivo", "—", "—"]
+    }
+    df = pd.DataFrame(data)
+    st.table(df)
+
+    st.button("+ Registrar pago por transferencia")
+
+    st.info("⚠️ Alerta automática: Aviso por correo a la participante y a la coordinadora cuando falten 10 días o menos.")
+    st.info("📑 Historial de pagos: Fecha, monto, método de pago y comprobante por participante.")
