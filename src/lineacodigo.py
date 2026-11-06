@@ -14,6 +14,19 @@ import calendar
 import csv
 import io
 import re
+import os
+
+from supabase import create_client, Client
+from dotenv import load_dotenv
+
+# Cargar variables de entorno
+load_dotenv()
+
+# Conectar con Supabase
+supabase_url = os.environ.get("SUPABASE_URL")
+supabase_key = os.environ.get("SUPABASE_KEY")
+supabase: Client = create_client(supabase_url, supabase_key)
+
 from datetime import date, datetime, timedelta
 from html import escape
 from pathlib import Path
@@ -446,88 +459,50 @@ def registrar_log(accion: str, detalle: str, archivo_nombre: str | None = None, 
     s.historial_logs.insert(0, dict(id=nuevo_id, ts=ahora(), accion=accion, detalle=detalle,
                                     archivo_nombre=archivo_nombre, archivo_bytes=archivo_bytes))
 
+def cargar_participantes_desde_db() -> list:
+    """Carga todos los participantes desde Supabase."""
+    try:
+        response = supabase.table("Participantes").select("*").execute()
+        return response.data
+    except Exception as e:
+        st.error(f"Error al cargar participantes: {e}")
+        return []
 
+#NUEVO SOLO PARA CONECTAR CON EL SUPABASE, SE DEBE REEMPLAZAR LA FUNCION INICIALIZAR DATOS PARA QUE CARGUE DESDE LA BASE DE DATOS EN LUGAR DE MEMORIA
 def iniciar_datos() -> None:
+    """Inicializa datos desde Supabase en lugar de memoria."""
     if "participantes" in st.session_state:
         return
-    h = hoy()
-    P = lambda i, n, rol, estado: dict(  # noqa: E731
-        id=i, nombre=n, correo=f"{n.lower().replace(' ', '')}@ejemplo.cl", telefono="+56 9 0000 00" + f"{i:02d}",
-        rol=rol, pais="Chile", descripcion="", estado=estado, carta_nombre=None, carta=None)
-    st.session_state.participantes = [
-        P(1, "Participante A", "Emprendedora", "Activa"),
-        P(2, "Participante B", "Emprendedora", "Activa"),
-        P(3, "Participante C", "Emprendedora", "Activa"),
-        P(4, "Participante D", "Becada", "Activa"),
-        P(5, "Participante E", "Mentora", "En validación de perfil"),
-        P(6, "Participante F", "Becada", "Beca revocada"),
-        P(7, "Participante G", "Emprendedora", "Activa"),
-        P(8, "Participante H", "Emprendedora", "Activa"),
-        P(9, "Participante I", "Emprendedora", "Activa"),
-        P(10, "Participante J", "Becada", "Activa"),
-        P(11, "Participante K", "Becada", "Beca vencida"),
-    ]
-    for pid, pais in ((3, "Perú"), (7, "Colombia"), (9, "México")):
-        participante(pid)["pais"] = pais
-    p5 = participante(5)
-    p5["carta_nombre"], p5["carta"] = None, None
-    for pid in (1, 2):
-        p = participante(pid)
-        p["carta_nombre"], p["carta"] = "carta_compromiso_demo.png", voucher_demo("Carta de compromiso")
-
-    venc = {1: h + timedelta(days=3), 7: h + timedelta(days=8), 8: h + timedelta(days=10),
-            9: h + timedelta(days=21), 2: h + timedelta(days=150), 3: h - timedelta(days=60)}
-    st.session_state.membresias = {pid: dict(inicio=sumar_meses(v, -6), vencimiento=v) for pid, v in venc.items()}
-    pagos = [(pid, sumar_meses(v, -6)) for pid, v in venc.items()]
-    ids = [1, 2, 3, 7, 8, 9]
-    for meses_atras, cantidad in [(5, 2), (4, 3), (3, 3), (2, 5), (1, 6), (0, 8)]:
-        a_, m_ = divmod(h.year * 12 + h.month - 1 - meses_atras, 12)
-        for k in range(cantidad):
-            dia = min(2 + 3 * k, h.day if meses_atras == 0 else 28)
-            pagos.append((ids[k % len(ids)], date(a_, m_ + 1, dia)))
-    metodos = ["Transferencia", "Transferencia", "PayPal", "Voucher"]
-    st.session_state.pagos = [
-        dict(id=i + 1, participante_id=pid, fecha=f, monto=PRECIO_DEMO, metodo=metodos[i % len(metodos)],
-             comprobante_nombre="comprobante_demo.png", comprobante=voucher_demo(f"Pago #{i + 1}"))
-        for i, (pid, f) in enumerate(pagos)
-    ]
-    st.session_state.donaciones = [
-        dict(id=1, donante="Empresa Colaboradora S.A.", monto=150000, fecha=h - timedelta(days=20),
-             comprobante_nombre="donacion_1.png", comprobante=voucher_demo("Donación corporativa")),
-        dict(id=2, donante="Fundación Amigos", monto=80000, fecha=h - timedelta(days=100),
-             comprobante_nombre=None, comprobante=None),
-    ]
-
-    B = lambda i, pid, desde, hasta, estado, motivo: dict(  # noqa: E731
-        id=i, participante_id=pid, motivo=motivo, asignacion=desde, inicio=desde, termino=hasta, estado=estado)
-    st.session_state.becas = [
-        B(1, 4, h - timedelta(days=90), h + timedelta(days=90), "Activa", "Situación económica"),
-        B(2, 10, h - timedelta(days=60), h + timedelta(days=120), "Activa", "Emprendimiento en etapa inicial"),
-        B(3, 6, h - timedelta(days=120), h + timedelta(days=60), "Revocada", "Beca inicial"),
-        B(4, 11, h - timedelta(days=300), h - timedelta(days=30), "Activa", "Beca inicial"),
-    ]
-
-    defs = [(63, "Taller", "Finanzas básicas", "Online"), (56, "Mentoría", "Mentoría 1 a 1", "Online"),
-            (49, "Taller", "Marca personal", "Online"), (42, "Charla", "Charla inspiradora", "Presencial"),
-            (35, "Coaching", "Sesión de coaching", "Online"), (28, "Taller", "Marketing digital", "Online"),
-            (21, "Mentoría", "Mentoría 1 a 1", "Online"), (14, "Taller", "Marca personal", "Presencial"),
-            (7, "Coaching", "Sesión de coaching", "Online"), (2, "Taller", "Finanzas básicas", "Online")]
-    st.session_state.actividades = [dict(id=i + 1, tipo=t, nombre=n, fecha=h - timedelta(days=d), modalidad=m)
-                                    for i, (d, t, n, m) in enumerate(defs)]
-    nivel = {1: 9, 2: 7, 3: 5, 4: 9, 6: 4, 7: 8, 8: 6, 9: 7, 10: 8, 11: 5}
-    st.session_state.asistencias = {(a["id"], pid) for a in st.session_state.actividades for pid, nv in nivel.items()
-                                    if (pid * 7 + a["id"] * 3) % 10 < nv}
-    # Ausencias marcadas explícitamente (las 2 actividades más recientes quedan sin marcar para la demo)
-    st.session_state.ausencias = {(a["id"], pid) for a in st.session_state.actividades[:-2] for pid in nivel
-                                  if (a["id"], pid) not in st.session_state.asistencias}
-
-    base = datetime(h.year, h.month, h.day, 12, 0)
-    st.session_state.historial_logs = [
-        dict(id=2, ts=base - timedelta(days=2, hours=-3, minutes=-30), accion="Asignación de beca",
-             detalle="Se otorgó beca a Participante D.", archivo_nombre=None, archivo_bytes=None),
-        dict(id=1, ts=base - timedelta(days=1), accion="Registro de participante",
-             detalle="Se agregó a Participante A como Emprendedora.", archivo_nombre=None, archivo_bytes=None),
-    ]
+    
+    # Cargar desde Supabase
+    participantes_db = cargar_participantes_desde_db()
+    
+    # Convertir a formato que entiende el código existente
+    st.session_state.participantes = []
+    for p in participantes_db:
+        st.session_state.participantes.append({
+            "id": p["id"],
+            "nombre": p["nombre"],
+            "correo": p["correo"],
+            "telefono": p.get("telefono", ""),
+            "pais": p.get("pais", "Chile"),
+            "rol": p.get("rol", "Emprendedora"),
+            "descripcion": "",
+            "estado": p.get("estado", "Activa"),
+            "carta_nombre": None,
+            "carta": None
+        })
+    
+    # Inicializar otras estructuras en memoria (por ahora)
+    # TODO: Crear tablas en Supabase para: membresias, pagos, becas, actividades, etc.
+    st.session_state.membresias = {}
+    st.session_state.pagos = []
+    st.session_state.donaciones = []
+    st.session_state.becas = []
+    st.session_state.actividades = []
+    st.session_state.asistencias = set()
+    st.session_state.ausencias = set()
+    st.session_state.historial_logs = []
 
 
 def participante(pid: int) -> dict:
@@ -583,11 +558,31 @@ def registrar_donacion(donante: str, monto: int, fecha: date, archivo) -> None:
 def email_valido(c: str) -> bool:
     return re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", c) is not None
 
+#NUEVO, PARA EL SUPABASE
+def guardar_participante_en_db(nombre: str, correo: str, telefono: str, pais: str, rol: str, estado: str) -> bool:
+    """Guarda un nuevo participante en la tabla de Supabase."""
+    try:
+        response = supabase.table("Participantes").insert({
+            "nombre": nombre,
+            "correo": correo,
+            "telefono": telefono,
+            "pais": pais,
+            "rol": rol,
+            "estado": estado
+        }).execute()
+        return True
+    except Exception as e:
+        st.error(f"Error al guardar en base de datos: {e}")
+        return False
+#HASTA AQUI
 
+#NUEVO PARA EL SUPABASE
 def guardar_participante() -> None:
     s = st.session_state
     nombre, correo = s.f_nombre.strip(), s.f_correo.strip().lower()
     carta = s.get(f"f_carta_{s.carta_n}")
+    
+    # Validaciones
     if not nombre or not correo or not s.f_rol or not s.f_pais:
         s.f_msg = ("error", "Completa nombre, correo, país y rol para guardar.")
     elif not email_valido(correo):
@@ -598,16 +593,28 @@ def guardar_participante() -> None:
         s.f_msg = ("error", "La carta de compromiso es obligatoria para registrar a una mentora.")
     else:
         estado = SIGUIENTE_PASO[s.f_rol][0]
-        s.participantes.append(dict(
-            id=max(p["id"] for p in s.participantes) + 1, nombre=nombre, correo=correo, telefono=s.f_tel.strip(),
-            pais=s.f_pais, rol=s.f_rol, descripcion=s.f_desc.strip(), estado=estado,
-            carta_nombre=carta.name if carta else None, carta=carta.getvalue() if carta else None))
-        s.f_msg = ("ok", f"{nombre} quedó registrada como {s.f_rol.lower()} · siguiente paso: {estado.lower()}.")
-        registrar_log("Registro de participante", f"Se agregó a {nombre} ({s.f_pais}) como {s.f_rol}.",
-                      carta.name if carta else None, carta.getvalue() if carta else None)
-        s.f_nombre = s.f_correo = s.f_tel = s.f_desc = ""
-        s.f_rol = None
-        s.carta_n += 1
+        
+        # 1. Intentar guardar en Supabase primero
+        if guardar_participante_en_db(nombre, correo, s.f_tel.strip(), s.f_pais, s.f_rol, estado):
+            
+            # 2. Si fue exitoso, actualizar también la sesión local para que se vea al instante
+            nuevo_id = max((p["id"] for p in s.participantes), default=0) + 1
+            s.participantes.append(dict(
+                id=nuevo_id, nombre=nombre, correo=correo, telefono=s.f_tel.strip(),
+                pais=s.f_pais, rol=s.f_rol, descripcion=s.f_desc.strip(), estado=estado,
+                carta_nombre=carta.name if carta else None, carta=carta.getvalue() if carta else None))
+            
+            s.f_msg = ("ok", f"{nombre} quedó registrada como {s.f_rol.lower()} · siguiente paso: {estado.lower()}.")
+            registrar_log("Registro de participante", f"Se agregó a {nombre} ({s.f_pais}) como {s.f_rol}.",
+                          carta.name if carta else None, carta.getvalue() if carta else None)
+            
+            # Limpiar el formulario
+            s.f_nombre = s.f_correo = s.f_tel = s.f_desc = ""
+            s.f_rol = None
+            s.carta_n += 1
+        else:
+            s.f_msg = ("error", "No se pudo guardar en la base de datos. Intenta de nuevo.")
+#Hasta aqui
 
 
 def beca_actual(pid: int) -> dict | None:
