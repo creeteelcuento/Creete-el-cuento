@@ -463,51 +463,122 @@ def cargar_participantes_desde_db() -> list:
     """Carga todos los participantes desde Supabase."""
     try:
         response = supabase.table("Participantes").select("*").execute()
-        return response.data
+        return response.data if response.data else []
     except Exception as e:
-        st.error(f"Error al cargar participantes: {e}")
+        print(f"Error al cargar participantes: {e}")
         return []
 
-#NUEVO SOLO PARA CONECTAR CON EL SUPABASE, SE DEBE REEMPLAZAR LA FUNCION INICIALIZAR DATOS PARA QUE CARGUE DESDE LA BASE DE DATOS EN LUGAR DE MEMORIA
+# ─────────────────────────────────────────────────────────────────────────────
+# FUNCIONES PARA ACTIVIDADES Y ASISTENCIA (SUPABASE)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cargar_actividades_desde_db() -> list:
+    try:
+        response = supabase.table("Actividades").select("*").order("fecha", desc=True).execute()
+        return response.data if response.data else []
+    except Exception as e:
+        print(f"Error al cargar actividades: {e}")
+        return []
+
+def guardar_actividad_en_db(nombre: str, tipo: str, modalidad: str, fecha: date, descripcion: str = "") -> dict | None:
+    try:
+        data = {
+            "nombre": nombre,
+            "tipo": tipo,
+            "modalidad": modalidad,
+            "fecha": fecha.isoformat(),
+            "descripcion": descripcion
+        }
+        response = supabase.table("Actividades").insert(data).execute()
+        return response.data[0] if response.data else None
+    except Exception as e:
+        print(f"Error al guardar actividad: {e}")
+        return None
+
+def cargar_asistencias_desde_db() -> tuple[set, set]:
+    presentes, ausentes = set(), set()
+    try:
+        response = supabase.table("Asistencia_actividad").select("actividad_id, participante_id, asistio").execute()
+        for r in response.data:
+            key = (r["actividad_id"], r["participante_id"])
+            if r["asistio"]: presentes.add(key)
+            else: ausentes.add(key)
+    except Exception as e:
+        print(f"Error al cargar asistencias: {e}")
+    return presentes, ausentes
+
+def guardar_asistencia_en_db(actividad_id: int, participante_id: int, asistio: bool) -> bool:
+    try:
+        data = {"actividad_id": actividad_id, "participante_id": participante_id, "asistio": asistio}
+        supabase.table("Asistencia_actividad").upsert(data, on_conflict="actividad_id,participante_id").execute()
+        return True
+    except Exception as e:
+        print(f"Error al guardar asistencia: {e}")
+        return False
+
+def borrar_asistencia_db(actividad_id: int, participante_id: int) -> bool:
+    """Elimina el registro de asistencia cuando se desmarca (vuelve a blanco)."""
+    try:
+        supabase.table("Asistencia_actividad").delete().eq("actividad_id", actividad_id).eq("participante_id", participante_id).execute()
+        return True
+    except Exception as e:
+        print(f"Error al borrar asistencia: {e}")
+        return False
+
 def iniciar_datos() -> None:
-    """Inicializa datos desde Supabase en lugar de memoria."""
-    if "participantes" in st.session_state:
-        return
+    """Inicializa datos desde Supabase."""
+    if "participantes" in st.session_state and "actividades" in st.session_state:
+        return  # Ya está inicializado
     
-    # Cargar desde Supabase
-    participantes_db = cargar_participantes_desde_db()
+    s = st.session_state
     
-    # Convertir a formato que entiende el código existente
-    st.session_state.participantes = []
-    for p in participantes_db:
-        st.session_state.participantes.append({
-            "id": p["id"],
-            "nombre": p["nombre"],
-            "correo": p["correo"],
-            "telefono": p.get("telefono", ""),
-            "pais": p.get("pais", "Chile"),
-            "rol": p.get("rol", "Emprendedora"),
-            "descripcion": "",
-            "estado": p.get("estado", "Activa"),
-            "carta_nombre": None,
-            "carta": None
+    # 1. Participantes
+    s.participantes = []
+    for p in cargar_participantes_desde_db():
+        s.participantes.append({
+            "id": p["id"], "nombre": p["nombre"], "correo": p["correo"],
+            "telefono": p.get("telefono", ""), "pais": p.get("pais", "Chile"),
+            "rol": p.get("rol", "Emprendedora"), "descripcion": "",
+            "estado": p.get("estado", "Activa"), "carta_nombre": None, "carta": None
         })
     
-    # Inicializar otras estructuras en memoria (por ahora)
-    # TODO: Crear tablas en Supabase para: membresias, pagos, becas, actividades, etc.
-    st.session_state.membresias = {}
-    st.session_state.pagos = []
-    st.session_state.donaciones = []
-    st.session_state.becas = []
-    st.session_state.actividades = []
-    st.session_state.asistencias = set()
-    st.session_state.ausencias = set()
-    st.session_state.historial_logs = []
+    # 2. Actividades
+    s.actividades = []
+    for a in cargar_actividades_desde_db():
+        fecha = datetime.fromisoformat(a["fecha"]).date() if isinstance(a["fecha"], str) else a["fecha"]
+        s.actividades.append({
+            "id": a["id"], "tipo": a.get("tipo", "Taller"), "nombre": a.get("nombre", ""),
+            "fecha": fecha, "modalidad": a.get("modalidad", "Online"), "descripcion": a.get("descripcion", "")
+        })
+    
+    # 3. Asistencias
+    s.asistencias, s.ausencias = cargar_asistencias_desde_db()
+    
+    # 4. Otros estados en memoria
+    s.membresias, s.pagos, s.donaciones, s.becas, s.historial_logs = {}, [], [], [], []
+    s.carta_n, s.beca_n, s.pagina = 0, 0, "Panel"
 
 
 def participante(pid: int) -> dict:
     return next(p for p in st.session_state.participantes if p["id"] == pid)
 
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def crear_actividad(tipo: str, nombre: str, fecha: date, modalidad: str, descripcion: str = "") -> bool:
+    """Crea una actividad y la guarda en Supabase."""
+    s = st.session_state
+    
+    actividad_db = guardar_actividad_en_db(nombre or tipo, tipo, modalidad, fecha, descripcion)
+    
+    if actividad_db:
+        s.actividades.append({
+            "id": actividad_db["id"], "tipo": tipo, "nombre": nombre or tipo,
+            "fecha": fecha, "modalidad": modalidad, "descripcion": descripcion
+        })
+        registrar_log("Nueva actividad", f"Se creó '{nombre or tipo}' ({tipo}, {modalidad.lower()}) para el {fecha_txt(fecha)}.")
+        return True
+    return False
 
 def estado_pago(p: dict) -> str | None:
     b = beca_actual(p["id"])
@@ -650,26 +721,25 @@ def marca(aid: int, pid: int) -> str:
     k = (aid, pid)
     return "presente" if k in s.asistencias else "ausente" if k in s.ausencias else "sin marcar"
 
-
 def ciclar_asistencia(aid: int, pid: int) -> None:
     """Círculo blanco → verde (presente) → rojo (ausente) → blanco."""
     s = st.session_state
     k = (aid, pid)
+    
     if k in s.asistencias:
+        # Presente → Ausente
         s.asistencias.discard(k)
         s.ausencias.add(k)
+        guardar_asistencia_en_db(aid, pid, False)
     elif k in s.ausencias:
+        # Ausente → Sin marcar (Blanco)
         s.ausencias.discard(k)
+        borrar_asistencia_db(aid, pid)  # <-- CORRECCIÓN: Borramos de la DB en lugar de enviar None
     else:
+        # Sin marcar → Presente
         s.asistencias.add(k)
-
-
-def crear_actividad(tipo: str, nombre: str, fecha: date, modalidad: str) -> None:
-    s = st.session_state
-    aid = max([a["id"] for a in s.actividades] + [0]) + 1
-    s.actividades.append(dict(id=aid, tipo=tipo, nombre=nombre or tipo, fecha=fecha, modalidad=modalidad))
-    registrar_log("Nueva actividad", f"Se creó '{nombre or tipo}' ({tipo}, {modalidad.lower()}) para el {fecha_txt(fecha)}.")
-
+        guardar_asistencia_en_db(aid, pid, True)
+        
 
 def pct_asistencia(pid: int, acts: list[dict]) -> int | None:
     """% de presencias sobre las actividades que SÍ fueron marcadas (blanco = no cuenta)."""
@@ -805,15 +875,23 @@ def dialogo_subir_carta(pid: int) -> None:
 
 @st.dialog("Nueva actividad", width="large")
 def dialogo_actividad() -> None:
+    """Diálogo para crear nueva actividad con persistencia en Supabase."""
     c1, c2 = st.columns(2)
     tipo = c1.selectbox("Tipo de actividad", TIPOS_ACTIVIDAD)
     modalidad = c2.selectbox("Modalidad", MODALIDADES)
-    nombre = st.text_input("Nombre de la actividad (opcional)", placeholder="Ej. Marca personal")
+    nombre = st.text_input("Nombre de la actividad (opcional)", 
+                          placeholder="Ej. Marca personal")
     fecha = st.date_input("Fecha", value=hoy(), format="DD/MM/YYYY")
+    descripcion = st.text_area("Descripción (opcional)", 
+                              placeholder="Detalles adicionales...",
+                              height=80)
+    
     if st.button("Crear actividad", key="btn_crear_actividad"):
-        crear_actividad(tipo, nombre.strip(), fecha, modalidad)
-        st.session_state.flash = f"Actividad creada para el {fecha_txt(fecha)}."
-        st.rerun()
+        if crear_actividad(tipo, nombre.strip(), fecha, modalidad, descripcion.strip()):
+            st.session_state.flash = f"Actividad creada para el {fecha_txt(fecha)}."
+            st.rerun()
+        else:
+            st.error("No se pudo crear la actividad. Intenta de nuevo.")
 
 
 @st.dialog("Revocar beca")
