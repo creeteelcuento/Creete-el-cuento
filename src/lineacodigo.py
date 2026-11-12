@@ -525,40 +525,117 @@ def borrar_asistencia_db(actividad_id: int, participante_id: int) -> bool:
         print(f"Error al borrar asistencia: {e}")
         return False
 
+
+#INICIO DE DATOS CAMBIADO NUEVAMENTE
 def iniciar_datos() -> None:
     """Inicializa datos desde Supabase."""
-    if "participantes" in st.session_state and "actividades" in st.session_state:
-        return  # Ya está inicializado
-    
     s = st.session_state
     
-    # 1. Participantes
-    s.participantes = []
-    for p in cargar_participantes_desde_db():
-        s.participantes.append({
-            "id": p["id"], "nombre": p["nombre"], "correo": p["correo"],
-            "telefono": p.get("telefono", ""), "pais": p.get("pais", "Chile"),
-            "rol": p.get("rol", "Emprendedora"), "descripcion": "",
-            "estado": p.get("estado", "Activa"), "carta_nombre": None, "carta": None
-        })
+    # 1. Inicializar TODOS los atributos (evita errores)
+    s.setdefault("participantes", [])
+    s.setdefault("actividades", [])
+    s.setdefault("asistencias", set())
+    s.setdefault("ausencias", set())
+    s.setdefault("membresias", {})  # ⭐ CLAVE: inicializar membresias
+    s.setdefault("pagos", [])
+    s.setdefault("donaciones", [])
+    s.setdefault("becas", [])
+    s.setdefault("historial_logs", [])
+    s.setdefault("carta_n", 0)
+    s.setdefault("beca_n", 0)
+    s.setdefault("pagina", "Panel")
     
-    # 2. Actividades
-    s.actividades = []
-    for a in cargar_actividades_desde_db():
-        fecha = datetime.fromisoformat(a["fecha"]).date() if isinstance(a["fecha"], str) else a["fecha"]
-        s.actividades.append({
-            "id": a["id"], "tipo": a.get("tipo", "Taller"), "nombre": a.get("nombre", ""),
-            "fecha": fecha, "modalidad": a.get("modalidad", "Online"), "descripcion": a.get("descripcion", "")
-        })
+    # 2. Si ya hay datos en session_state, no recargar
+    if s.participantes:
+        return
     
-    # 3. Asistencias
-    s.asistencias, s.ausencias = cargar_asistencias_desde_db()
+    # 3. Cargar participantes desde Supabase
+    try:
+        participantes_db = cargar_participantes_desde_db()
+        for p in participantes_db:
+            s.participantes.append({
+                "id": p["id"], 
+                "nombre": p["nombre"], 
+                "correo": p["correo"],
+                "telefono": p.get("telefono", ""), 
+                "pais": p.get("pais", "Chile"),
+                "rol": p.get("rol", "Emprendedora"), 
+                "descripcion": "",
+                "estado": p.get("estado", "Activa"), 
+                "carta_nombre": None, 
+                "carta": None
+            })
+    except Exception as e:
+        print(f"Error cargando participantes: {e}")
     
-    # 4. Otros estados en memoria
-    s.membresias, s.pagos, s.donaciones, s.becas, s.historial_logs = {}, [], [], [], []
-    s.carta_n, s.beca_n, s.pagina = 0, 0, "Panel"
-
-
+    # 4. Cargar actividades
+    try:
+        actividades_db = cargar_actividades_desde_db()
+        for a in actividades_db:
+            fecha = datetime.fromisoformat(a["fecha"]).date() if isinstance(a["fecha"], str) else a["fecha"]
+            s.actividades.append({
+                "id": a["id"], 
+                "tipo": a.get("tipo", "Taller"), 
+                "nombre": a.get("nombre", ""),
+                "fecha": fecha, 
+                "modalidad": a.get("modalidad", "Online"), 
+                "descripcion": a.get("descripcion", "")
+            })
+    except Exception as e:
+        print(f"Error cargando actividades: {e}")
+    
+    # 5. Cargar asistencias
+    try:
+        s.asistencias, s.ausencias = cargar_asistencias_desde_db()
+    except Exception as e:
+        print(f"Error cargando asistencias: {e}")
+    
+    # 6. Cargar pagos y actualizar membresías
+    try:
+        pagos_db = cargar_pagos_desde_db()
+        for pago in pagos_db:
+            fecha_pago = datetime.fromisoformat(pago["fecha_pago"]).date() if isinstance(pago["fecha_pago"], str) else pago["fecha_pago"]
+            
+            s.pagos.append({
+                "id": pago["id"],
+                "participante_id": pago["participante_id"],
+                "fecha": fecha_pago,
+                "monto": pago["monto"],
+                "metodo": pago.get("metodo_pago", ""),
+                "comprobante_nombre": None,
+                "comprobante": None,
+                "comprobante_url": pago.get("comprobante_url")
+            })
+            
+            # Actualizar membresía si es el pago más reciente
+            pid = pago["participante_id"]
+            if pid not in s.membresias or fecha_pago > s.membresias[pid]["inicio"]:
+                from datetime import timedelta
+                duracion = pago.get("duracion_meses", 6)
+                s.membresias[pid] = dict(
+                    inicio=fecha_pago,
+                    vencimiento=fecha_pago + timedelta(days=duracion * 30)
+                )
+    except Exception as e:
+        print(f"Error cargando pagos: {e}")
+    
+    # 7. Cargar donaciones
+    try:
+        donaciones_db = cargar_donaciones_desde_db()
+        for don in donaciones_db:
+            fecha_don = datetime.fromisoformat(don["fecha_donacion"]).date() if isinstance(don["fecha_donacion"], str) else don["fecha_donacion"]
+            s.donaciones.append({
+                "id": don["id"],
+                "donante": don["nombre_donante"],
+                "monto": don["monto"],
+                "fecha": fecha_don,
+                "comprobante_nombre": None,
+                "comprobante": None,
+                "comprobante_url": don.get("comprobante_url")
+            })
+    except Exception as e:
+        print(f"Error cargando donaciones: {e}")
+        
 def participante(pid: int) -> dict:
     return next(p for p in st.session_state.participantes if p["id"] == pid)
 
@@ -580,13 +657,22 @@ def crear_actividad(tipo: str, nombre: str, fecha: date, modalidad: str, descrip
         return True
     return False
 
+#CORRECCIÓN A ERROR Y ESTADO DE PAGO, PARA SUPABASE
+
 def estado_pago(p: dict) -> str | None:
+    """Determina el estado del pago de una participante."""
+    s = st.session_state
+    
+    # Verificar si tiene beca activa
     b = beca_actual(p["id"])
     if b and estado_beca(b) == "Activa":
         return "Becado (exento)"
-    m = st.session_state.membresias.get(p["id"])
+    
+    # Verificar membresía (usando .get() para evitar error si no existe)
+    m = s.membresias.get(p["id"]) if hasattr(s, 'membresias') else None
     if not m:
         return None
+    
     dias = (m["vencimiento"] - hoy()).days
     return "Vencido" if dias < 0 else "Por vencer" if dias <= DIAS_ALERTA else "Pagado"
 
@@ -606,25 +692,79 @@ def ultimo_comprobante(pid: int) -> dict | None:
     cs = [x for x in st.session_state.pagos if x["participante_id"] == pid and x["comprobante"]]
     return max(cs, key=lambda x: (x["fecha"], x["id"])) if cs else None
 
+#CONECTADO CON SUPABASE REGISTRO DE PAGO
 
-def registrar_pago(pid: int, monto: int, metodo: str, fecha: date, meses: int, archivo) -> None:
+def registrar_pago(pid: int, monto: int, metodo: str, fecha: date, meses: int, archivo) -> bool:
+    """Registra un pago en memoria Y en Supabase."""
     s = st.session_state
-    s.pagos.append(dict(id=max([x["id"] for x in s.pagos] + [0]) + 1, participante_id=pid, fecha=fecha, monto=monto,
-                        metodo=metodo, comprobante_nombre=archivo.name, comprobante=archivo.getvalue()))
-    s.membresias[pid] = dict(inicio=fecha, vencimiento=sumar_meses(fecha, meses))
+    
+    # 1. Subir comprobante a Storage (si existe)
+    comprobante_url = None
+    if archivo:
+        comprobante_url = subir_comprobante_a_storage("pagos", archivo)
+    
+    # 2. Guardar en Supabase
+    pago_db = guardar_pago_en_db(pid, monto, metodo, fecha, meses, comprobante_url)
+    
+    if not pago_db:
+        return False
+    
+    # 3. Guardar también en memoria (para que se vea al instante)
+    s.pagos.append(dict(
+        id=pago_db["id"],
+        participante_id=pid, 
+        fecha=fecha, 
+        monto=monto,
+        metodo=metodo, 
+        comprobante_nombre=archivo.name if archivo else None, 
+        comprobante=archivo.getvalue() if archivo else None,
+        comprobante_url=comprobante_url
+    ))
+    
+    # 4. Actualizar membresía
+    from datetime import timedelta
+    s.membresias[pid] = dict(inicio=fecha, vencimiento=fecha + timedelta(days=meses * 30))
     participante(pid)["estado"] = "Activa"
+    
+    # 5. Registrar en el historial
     registrar_log("Registro de pago", f"Se registró pago de {plata(monto)} para {participante(pid)['nombre']}.",
-                  archivo.name, archivo.getvalue())
+                  archivo.name if archivo else None, archivo.getvalue() if archivo else None)
+    
+    return True
 
+#CONECTADO CON SUPABASE REGISTRO DE DONACION NUEVO
 
-def registrar_donacion(donante: str, monto: int, fecha: date, archivo) -> None:
+def registrar_donacion(donante: str, monto: int, fecha: date, archivo) -> bool:
+    """Registra una donación en memoria Y en Supabase."""
     s = st.session_state
-    s.donaciones.append(dict(id=max([x["id"] for x in s.donaciones] + [0]) + 1, donante=donante, monto=monto, fecha=fecha,
-                             comprobante_nombre=archivo.name if archivo else None,
-                             comprobante=archivo.getvalue() if archivo else None))
+    
+    # 1. Subir comprobante a Storage (si existe)
+    comprobante_url = None
+    if archivo:
+        comprobante_url = subir_comprobante_a_storage("donaciones", archivo)
+    
+    # 2. Guardar en Supabase
+    donacion_db = guardar_donacion_en_db(donante, monto, fecha, comprobante_url)
+    
+    if not donacion_db:
+        return False
+    
+    # 3. Guardar también en memoria (para que se vea al instante)
+    s.donaciones.append(dict(
+        id=donacion_db["id"],
+        donante=donante, 
+        monto=monto, 
+        fecha=fecha,
+        comprobante_nombre=archivo.name if archivo else None,
+        comprobante=archivo.getvalue() if archivo else None,
+        comprobante_url=comprobante_url
+    ))
+    
+    # 4. Registrar en el historial
     registrar_log("Registro de donación", f"Se registró donación de {plata(monto)} de '{donante}'.",
                   archivo.name if archivo else None, archivo.getvalue() if archivo else None)
-
+    
+    return True
 
 def email_valido(c: str) -> bool:
     return re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", c) is not None
@@ -687,6 +827,85 @@ def guardar_participante() -> None:
             s.f_msg = ("error", "No se pudo guardar en la base de datos. Intenta de nuevo.")
 #Hasta aqui
 
+# ────────────────────────────────────────────────────────────────────────────
+# FUNCIONES PARA PAGOS Y DONACIONES (SUPABASE)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cargar_pagos_desde_db() -> list:
+    """Carga todos los pagos desde Supabase."""
+    try:
+        response = supabase.table("Pagos").select("*").order("fecha_pago", desc=True).execute()
+        return response.data if response.data else []
+    except Exception as e:
+        print(f"Error al cargar pagos: {e}")
+        return []
+
+def cargar_donaciones_desde_db() -> list:
+    """Carga todas las donaciones desde Supabase."""
+    try:
+        response = supabase.table("Donaciones").select("*").order("fecha_donacion", desc=True).execute()
+        return response.data if response.data else []
+    except Exception as e:
+        print(f"Error al cargar donaciones: {e}")
+        return []
+
+def guardar_pago_en_db(participante_id: int, monto: int, metodo_pago: str, 
+                       fecha_pago: date, duracion_meses: int, comprobante_url: str = None) -> dict | None:
+    """Guarda un pago en Supabase y retorna el registro creado."""
+    try:
+        # Calcular fecha de vencimiento
+        from datetime import timedelta
+        fecha_vencimiento = fecha_pago + timedelta(days=duracion_meses * 30)
+        
+        data = {
+            "participante_id": participante_id,
+            "monto": monto,
+            "metodo_pago": metodo_pago,
+            "fecha_pago": fecha_pago.isoformat(),
+            "duracion_meses": duracion_meses,
+            "fecha_vencimiento": fecha_vencimiento.isoformat(),
+            "comprobante_url": comprobante_url,
+            "estado": "al_dia"
+        }
+        
+        response = supabase.table("Pagos").insert(data).execute()
+        return response.data[0] if response.data else None
+    except Exception as e:
+        print(f"Error al guardar pago: {e}")
+        return None
+
+def guardar_donacion_en_db(nombre_donante: str, monto: int, 
+                           fecha_donacion: date, comprobante_url: str = None) -> dict | None:
+    """Guarda una donación en Supabase y retorna el registro creado."""
+    try:
+        data = {
+            "nombre_donante": nombre_donante,
+            "monto": monto,
+            "fecha_donacion": fecha_donacion.isoformat(),
+            "comprobante_url": comprobante_url
+        }
+        
+        response = supabase.table("Donaciones").insert(data).execute()
+        return response.data[0] if response.data else None
+    except Exception as e:
+        print(f"Error al guardar donación: {e}")
+        return None
+
+def subir_comprobante_a_storage(tipo: str, archivo) -> str | None:
+    """Sube un comprobante a Storage y retorna la URL pública."""
+    try:
+        import time
+        file_name = f"{tipo}/{int(time.time())}_{archivo.name}"
+        
+        # Subir archivo
+        supabase.storage.from_("comprobantes").upload(file_name, archivo.getvalue())
+        
+        # Obtener URL pública
+        public_url = supabase.storage.from_("comprobantes").get_public_url(file_name)
+        return public_url
+    except Exception as e:
+        print(f"Error al subir comprobante: {e}")
+        return None
 
 def beca_actual(pid: int) -> dict | None:
     recs = [b for b in st.session_state.becas if b["participante_id"] == pid]
