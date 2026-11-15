@@ -13,15 +13,31 @@ participantes, el control de cobros, la asistencia.
 
 ## Instalación
 
+### Inicio sencillo en Windows
+
+Cada integrante debe clonar el repositorio y abrir `iniciar.bat` desde la carpeta
+`Creete-el-cuento` (también se puede ejecutar con `.\iniciar.bat` desde PowerShell).
+El archivo crea `.venv` local si no existe, instala las dependencias de
+`requirements.txt` y ejecuta la aplicación. No es necesario activar el entorno
+virtual ni subirlo a GitHub.
+
+La primera ejecución necesita conexión a internet para instalar los paquetes.
+Antes de iniciar sesión, cada integrante debe copiar `.env.example` como `.env`
+y completar sus datos de Supabase. Comparte las claves de forma segura; no
+uses una clave `service_role` ni subas `.env` a GitHub.
+
+### Inicio manual
+
 Desde la carpeta del proyecto, instala las dependencias y ejecuta la aplicación:
 
 ```powershell
-python -m pip install -r requirements.txt
-python -m streamlit run .\src\lineacodigo.py
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r .\requirements.txt
+.\.venv\Scripts\python.exe -m streamlit run .\src\lineacodigo.py
 ```
 
-Si prefieres usar un entorno virtual, créalo y actívalo antes de instalar las
-dependencias. El directorio `.venv` es local y no se comparte por GitHub.
+Ejecuta estos comandos desde la carpeta `Creete-el-cuento`, donde está
+`requirements.txt`. El directorio `.venv` es local y no se comparte por GitHub.
 
 ### Opcional: pruebas para desarrollo
 
