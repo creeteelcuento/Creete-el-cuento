@@ -2,22 +2,42 @@
 Créete el Cuento · Sistema de gestión interno (prototipo funcional)
 
 Páginas: Panel · Participantes · Pagos · Asistencia · Becas · Seguimiento · Reportes · Historial.
-DATOS: por ahora todo vive en memoria (st.session_state) con datos ficticios,
-para que el prototipo corra sin base de datos.
+Participantes y actividades usan Supabase; pagos y comprobantes se guardan en
+Supabase y Storage. Otros módulos conservan estado de sesión local.
 
-Ejecutar:  streamlit run app.py
+Ejecutar:  streamlit run src/lineacodigo.py
 """
 from __future__ import annotations
 
 import base64
-import calendar
 import csv
 import io
 import re
 import os
 
-from supabase import create_client, Client
+from httpx import HTTPError
+from supabase import Client, SupabaseException
+from supabase_auth.errors import AuthApiError
 from dotenv import load_dotenv
+from auth_supabase import iniciar_sesion as iniciar_sesion_supabase
+from becas_estado import actividades_de_beca, beca_vigente, becas_para_listado, fechas_pago
+from becas_supabase import (
+    cargar_becas as cargar_becas_db,
+    guardar_beca as guardar_beca_db,
+    revocar_beca as revocar_beca_db,
+)
+from donaciones_supabase import (
+    cargar_donaciones as cargar_donaciones_db,
+    guardar_donacion as guardar_donacion_db,
+)
+from participantes_estado import estado_participante
+from pagos_supabase import (
+    cargar_pagos as cargar_pagos_db,
+    crear_membresias,
+    descargar_comprobante,
+    guardar_pago as guardar_pago_db,
+    sumar_meses,
+)
 
 # Cargar variables de entorno
 load_dotenv()
@@ -25,7 +45,7 @@ load_dotenv()
 # Conectar con Supabase
 supabase_url = os.environ.get("SUPABASE_URL")
 supabase_key = os.environ.get("SUPABASE_KEY")
-supabase: Client = create_client(supabase_url, supabase_key)
+SUPABASE_PAYMENTS_BUCKET = os.environ.get("SUPABASE_PAYMENTS_BUCKET", "comprobantes-pagos")
 
 from datetime import date, datetime, timedelta
 from html import escape
@@ -41,6 +61,14 @@ import streamlit as st
 
 # ─────────────────────────────── CONFIGURACIÓN ───────────────────────────────
 st.set_page_config(page_title="Créete el Cuento · Gestión", page_icon="💡", layout="wide")
+
+
+def cliente_supabase() -> Client:
+    cliente = st.session_state.get("_cliente_supabase")
+    if not isinstance(cliente, Client):
+        raise RuntimeError("Inicia sesión con Supabase Auth para acceder a los datos.")
+    return cliente
+
 
 ASSETS = Path(__file__).parent / "assets"
 NOMBRE_USUARIA = "[Nombre]"      # cámbialo por el nombre de la coordinadora
@@ -60,7 +88,7 @@ SIGUIENTE_PASO = {
 CARTA_TIPOS = ["png", "jpg", "jpeg", "pdf", "doc", "docx"]
 TIPOS_ACTIVIDAD = ["Taller", "Mentoría", "Coaching", "Charla"]
 MODALIDADES = ["Online", "Presencial"]
-ESTADOS = ["Pagado", "Vencido", "Por vencer", "Becado (exento)"]
+ESTADOS = ["Pendiente", "Pagado", "Vencido", "Por vencer", "Becado (exento)"]
 MESES = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
 MESES_LARGO = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre",
                "octubre", "noviembre", "diciembre"]
@@ -349,12 +377,6 @@ def fecha_larga(d: date) -> str:
     return f"{d.day} de {MESES_LARGO[d.month - 1]} de {d.year}"
 
 
-def sumar_meses(d: date, n: int) -> date:
-    m = d.month - 1 + n
-    a, m = d.year + m // 12, m % 12 + 1
-    return date(a, m, min(d.day, calendar.monthrange(a, m)[1]))
-
-
 def ultimos_meses(n: int) -> list[tuple[int, int]]:
     h = hoy()
     out = []
@@ -374,7 +396,7 @@ def total_mes(lista: list[dict], k: tuple[int, int]) -> int:
 
 def chip(estado: str) -> str:
     clase = {"Pagado": "c-pagado", "Por vencer": "c-vencer", "Vencido": "c-vencido", "Becado (exento)": "c-exento",
-             "Activa": "c-activa", "Inactiva": "c-inact"}.get(estado, "")
+             "Becada": "c-exento", "Activa": "c-activa", "Inactiva": "c-inact"}.get(estado, "")
     punto = "● " if estado in ("Pagado", "Por vencer", "Vencido") else ""
     return f'<span class="chip {clase}">{punto}{escape(estado)}</span>'
 
@@ -462,7 +484,7 @@ def registrar_log(accion: str, detalle: str, archivo_nombre: str | None = None, 
 def cargar_participantes_desde_db() -> list:
     """Carga todos los participantes desde Supabase."""
     try:
-        response = supabase.table("Participantes").select("*").execute()
+        response = cliente_supabase().table("Participantes").select("*").execute()
         return response.data if response.data else []
     except Exception as e:
         print(f"Error al cargar participantes: {e}")
@@ -474,7 +496,7 @@ def cargar_participantes_desde_db() -> list:
 
 def cargar_actividades_desde_db() -> list:
     try:
-        response = supabase.table("Actividades").select("*").order("fecha", desc=True).execute()
+        response = cliente_supabase().table("Actividades").select("*").order("fecha", desc=True).execute()
         return response.data if response.data else []
     except Exception as e:
         print(f"Error al cargar actividades: {e}")
@@ -489,7 +511,7 @@ def guardar_actividad_en_db(nombre: str, tipo: str, modalidad: str, fecha: date,
             "fecha": fecha.isoformat(),
             "descripcion": descripcion
         }
-        response = supabase.table("Actividades").insert(data).execute()
+        response = cliente_supabase().table("Actividades").insert(data).execute()
         return response.data[0] if response.data else None
     except Exception as e:
         print(f"Error al guardar actividad: {e}")
@@ -498,7 +520,7 @@ def guardar_actividad_en_db(nombre: str, tipo: str, modalidad: str, fecha: date,
 def cargar_asistencias_desde_db() -> tuple[set, set]:
     presentes, ausentes = set(), set()
     try:
-        response = supabase.table("Asistencia_actividad").select("actividad_id, participante_id, asistio").execute()
+        response = cliente_supabase().table("Asistencia_actividad").select("actividad_id, participante_id, asistio").execute()
         for r in response.data:
             key = (r["actividad_id"], r["participante_id"])
             if r["asistio"]: presentes.add(key)
@@ -510,7 +532,7 @@ def cargar_asistencias_desde_db() -> tuple[set, set]:
 def guardar_asistencia_en_db(actividad_id: int, participante_id: int, asistio: bool) -> bool:
     try:
         data = {"actividad_id": actividad_id, "participante_id": participante_id, "asistio": asistio}
-        supabase.table("Asistencia_actividad").upsert(data, on_conflict="actividad_id,participante_id").execute()
+        cliente_supabase().table("Asistencia_actividad").upsert(data, on_conflict="actividad_id,participante_id").execute()
         return True
     except Exception as e:
         print(f"Error al guardar asistencia: {e}")
@@ -519,7 +541,7 @@ def guardar_asistencia_en_db(actividad_id: int, participante_id: int, asistio: b
 def borrar_asistencia_db(actividad_id: int, participante_id: int) -> bool:
     """Elimina el registro de asistencia cuando se desmarca (vuelve a blanco)."""
     try:
-        supabase.table("Asistencia_actividad").delete().eq("actividad_id", actividad_id).eq("participante_id", participante_id).execute()
+        cliente_supabase().table("Asistencia_actividad").delete().eq("actividad_id", actividad_id).eq("participante_id", participante_id).execute()
         return True
     except Exception as e:
         print(f"Error al borrar asistencia: {e}")
@@ -527,7 +549,12 @@ def borrar_asistencia_db(actividad_id: int, participante_id: int) -> bool:
 
 def iniciar_datos() -> None:
     """Inicializa datos desde Supabase."""
-    if "participantes" in st.session_state and "actividades" in st.session_state:
+    requeridos = (
+        "participantes", "actividades", "asistencias", "ausencias", "pagos", "membresias",
+        "pagos_db_ok", "becas", "becas_db_ok", "donaciones", "donaciones_db_ok",
+        "historial_logs",
+    )
+    if all(key in st.session_state for key in requeridos):
         return  # Ya está inicializado
     
     s = st.session_state
@@ -554,8 +581,33 @@ def iniciar_datos() -> None:
     # 3. Asistencias
     s.asistencias, s.ausencias = cargar_asistencias_desde_db()
     
-    # 4. Otros estados en memoria
-    s.membresias, s.pagos, s.donaciones, s.becas, s.historial_logs = {}, [], [], [], []
+    # 4. Pagos persistidos; si falla la carga, se bloquean escrituras hasta reintentar.
+    try:
+        s.pagos = cargar_pagos_db(cliente_supabase())
+        s.membresias = crear_membresias(s.pagos)
+        s.pagos_db_ok, s.pagos_db_error = True, None
+    except Exception as exc:
+        s.membresias, s.pagos = {}, []
+        s.pagos_db_ok, s.pagos_db_error = False, str(exc)
+
+    # 5. Becas persistidas en Supabase.
+    try:
+        s.becas = cargar_becas_db(cliente_supabase())
+        s.becas_db_ok, s.becas_db_error = True, None
+    except Exception as exc:
+        s.becas = []
+        s.becas_db_ok, s.becas_db_error = False, str(exc)
+
+    # 6. Donaciones persistidas en Supabase.
+    try:
+        s.donaciones = cargar_donaciones_db(cliente_supabase())
+        s.donaciones_db_ok, s.donaciones_db_error = True, None
+    except Exception as exc:
+        s.donaciones = []
+        s.donaciones_db_ok, s.donaciones_db_error = False, str(exc)
+
+    # 7. Otros estados en memoria
+    s.historial_logs = []
     s.carta_n, s.beca_n, s.pagina = 0, 0, "Panel"
 
 
@@ -580,13 +632,13 @@ def crear_actividad(tipo: str, nombre: str, fecha: date, modalidad: str, descrip
         return True
     return False
 
-def estado_pago(p: dict) -> str | None:
+def estado_pago(p: dict) -> str:
     b = beca_actual(p["id"])
-    if b and estado_beca(b) == "Activa":
+    if beca_vigente(p, b, hoy()):
         return "Becado (exento)"
     m = st.session_state.membresias.get(p["id"])
     if not m:
-        return None
+        return "Pendiente"
     dias = (m["vencimiento"] - hoy()).days
     return "Vencido" if dias < 0 else "Por vencer" if dias <= DIAS_ALERTA else "Pagado"
 
@@ -595,33 +647,36 @@ def filas_pagos() -> list[dict]:
     filas = []
     for p in st.session_state.participantes:
         est = estado_pago(p)
-        if est is None:
-            continue
         m = st.session_state.membresias.get(p["id"], {})
-        filas.append(dict(p=p, estado=est, inicio=m.get("inicio"), vence=m.get("vencimiento")))
+        b = beca_actual(p["id"])
+        inicio, vence = fechas_pago(p, b, m, hoy())
+        filas.append(dict(p=p, estado=est, inicio=inicio, vence=vence))
     return filas
 
 
 def ultimo_comprobante(pid: int) -> dict | None:
-    cs = [x for x in st.session_state.pagos if x["participante_id"] == pid and x["comprobante"]]
-    return max(cs, key=lambda x: (x["fecha"], x["id"])) if cs else None
+    cs = [x for x in st.session_state.pagos if x["participante_id"] == pid and x["comprobante_url"]]
+    return max(cs, key=lambda x: (x["fecha"], str(x.get("creado_en") or ""), str(x["id"]))) if cs else None
 
 
-def registrar_pago(pid: int, monto: int, metodo: str, fecha: date, meses: int, archivo) -> None:
+def registrar_pago(pid: int, monto: int, metodo: str, fecha: date, meses: int, archivo=None) -> None:
     s = st.session_state
-    s.pagos.append(dict(id=max([x["id"] for x in s.pagos] + [0]) + 1, participante_id=pid, fecha=fecha, monto=monto,
-                        metodo=metodo, comprobante_nombre=archivo.name, comprobante=archivo.getvalue()))
-    s.membresias[pid] = dict(inicio=fecha, vencimiento=sumar_meses(fecha, meses))
+    pago = guardar_pago_db(
+        cliente_supabase(), SUPABASE_PAYMENTS_BUCKET, pid, monto, metodo, fecha, meses, archivo, hoy()
+    )
+    s.pagos.append(pago)
+    s.membresias[pid] = dict(inicio=pago["inicio"], vencimiento=pago["vencimiento"])
     participante(pid)["estado"] = "Activa"
     registrar_log("Registro de pago", f"Se registró pago de {plata(monto)} para {participante(pid)['nombre']}.",
-                  archivo.name, archivo.getvalue())
+                  archivo.name if archivo else None)
 
 
 def registrar_donacion(donante: str, monto: int, fecha: date, archivo) -> None:
     s = st.session_state
-    s.donaciones.append(dict(id=max([x["id"] for x in s.donaciones] + [0]) + 1, donante=donante, monto=monto, fecha=fecha,
-                             comprobante_nombre=archivo.name if archivo else None,
-                             comprobante=archivo.getvalue() if archivo else None))
+    donacion = guardar_donacion_db(
+        cliente_supabase(), SUPABASE_PAYMENTS_BUCKET, donante, monto, fecha, archivo
+    )
+    s.donaciones.append(donacion)
     registrar_log("Registro de donación", f"Se registró donación de {plata(monto)} de '{donante}'.",
                   archivo.name if archivo else None, archivo.getvalue() if archivo else None)
 
@@ -630,10 +685,12 @@ def email_valido(c: str) -> bool:
     return re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", c) is not None
 
 #NUEVO, PARA EL SUPABASE
-def guardar_participante_en_db(nombre: str, correo: str, telefono: str, pais: str, rol: str, estado: str) -> bool:
+def guardar_participante_en_db(
+    nombre: str, correo: str, telefono: str, pais: str, rol: str, estado: str
+) -> dict | None:
     """Guarda un nuevo participante en la tabla de Supabase."""
     try:
-        response = supabase.table("Participantes").insert({
+        response = cliente_supabase().table("Participantes").insert({
             "nombre": nombre,
             "correo": correo,
             "telefono": telefono,
@@ -641,10 +698,12 @@ def guardar_participante_en_db(nombre: str, correo: str, telefono: str, pais: st
             "rol": rol,
             "estado": estado
         }).execute()
-        return True
+        if not response.data:
+            raise RuntimeError("Supabase no confirmó el registro de la participante.")
+        return response.data[0]
     except Exception as e:
         st.error(f"Error al guardar en base de datos: {e}")
-        return False
+        return None
 #HASTA AQUI
 
 #NUEVO PARA EL SUPABASE
@@ -652,6 +711,10 @@ def guardar_participante() -> None:
     s = st.session_state
     nombre, correo = s.f_nombre.strip(), s.f_correo.strip().lower()
     carta = s.get(f"f_carta_{s.carta_n}")
+    es_becada = s.f_rol == "Becada"
+    motivo_beca = s.get("f_beca_motivo", "").strip()
+    inicio_beca = s.get("f_beca_inicio", hoy())
+    termino_beca = s.get("f_beca_termino", sumar_meses(hoy(), 6))
     
     # Validaciones
     if not nombre or not correo or not s.f_rol or not s.f_pais:
@@ -662,26 +725,54 @@ def guardar_participante() -> None:
         s.f_msg = ("error", "Ese correo ya está registrado: no se permiten duplicados.")
     elif s.f_rol == "Mentora" and carta is None:
         s.f_msg = ("error", "La carta de compromiso es obligatoria para registrar a una mentora.")
+    elif es_becada and not s.get("becas_db_ok", False):
+        s.f_msg = ("error", "No se puede registrar una becada porque la tabla de becas no está disponible. Ejecuta la migración indicada en el README y vuelve a iniciar sesión.")
+    elif es_becada and not motivo_beca:
+        s.f_msg = ("error", "Indica el motivo de asignación de la beca.")
+    elif es_becada and termino_beca <= inicio_beca:
+        s.f_msg = ("error", "El término de la beca debe ser posterior al inicio.")
     else:
         estado = SIGUIENTE_PASO[s.f_rol][0]
         
         # 1. Intentar guardar en Supabase primero
-        if guardar_participante_en_db(nombre, correo, s.f_tel.strip(), s.f_pais, s.f_rol, estado):
+        participante_db = guardar_participante_en_db(
+            nombre, correo, s.f_tel.strip(), s.f_pais, s.f_rol, estado
+        )
+        if participante_db:
             
             # 2. Si fue exitoso, actualizar también la sesión local para que se vea al instante
-            nuevo_id = max((p["id"] for p in s.participantes), default=0) + 1
+            nuevo_id = participante_db["id"]
             s.participantes.append(dict(
                 id=nuevo_id, nombre=nombre, correo=correo, telefono=s.f_tel.strip(),
                 pais=s.f_pais, rol=s.f_rol, descripcion=s.f_desc.strip(), estado=estado,
                 carta_nombre=carta.name if carta else None, carta=carta.getvalue() if carta else None))
             
-            s.f_msg = ("ok", f"{nombre} quedó registrada como {s.f_rol.lower()} · siguiente paso: {estado.lower()}.")
+            if es_becada:
+                try:
+                    asignar_beca(nuevo_id, motivo_beca, inicio_beca, termino_beca)
+                except Exception as exc:
+                    s.f_msg = (
+                        "error",
+                        f"{nombre} quedó registrada, pero no se pudo guardar su beca en Supabase: {exc}. "
+                        "No vuelvas a registrar a la participante; asigna la beca desde Gestión de becas.",
+                    )
+                else:
+                    s.f_msg = (
+                        "ok",
+                        f"{nombre} quedó registrada como becada con vigencia "
+                        f"{fecha_corta(inicio_beca)} – {fecha_corta(termino_beca)}.",
+                    )
+            else:
+                s.f_msg = ("ok", f"{nombre} quedó registrada como {s.f_rol.lower()} · siguiente paso: {estado.lower()}.")
             registrar_log("Registro de participante", f"Se agregó a {nombre} ({s.f_pais}) como {s.f_rol}.",
                           carta.name if carta else None, carta.getvalue() if carta else None)
             
             # Limpiar el formulario
             s.f_nombre = s.f_correo = s.f_tel = s.f_desc = ""
             s.f_rol = None
+            s.f_beca_motivo = ""
+            s.f_beca_inicio = hoy()
+            s.f_beca_termino = sumar_meses(hoy(), 6)
             s.carta_n += 1
         else:
             s.f_msg = ("error", "No se pudo guardar en la base de datos. Intenta de nuevo.")
@@ -694,7 +785,7 @@ def beca_actual(pid: int) -> dict | None:
 
 
 def estado_beca(b: dict) -> str:
-    return "Activa" if b["estado"] == "Activa" and b["termino"] >= hoy() else "Inactiva"
+    return "Activa" if beca_vigente({}, b, hoy()) else "Inactiva"
 
 
 def detalle_inactiva(b: dict) -> str:
@@ -703,15 +794,19 @@ def detalle_inactiva(b: dict) -> str:
 
 def asignar_beca(pid: int, motivo: str, inicio: date, termino: date) -> None:
     s = st.session_state
-    s.becas.append(dict(id=max([b["id"] for b in s.becas] + [0]) + 1, participante_id=pid, motivo=motivo,
-                        asignacion=hoy(), inicio=inicio, termino=termino, estado="Activa"))
+    beca = guardar_beca_db(cliente_supabase(), pid, motivo, inicio, termino, hoy())
+    s.becas.append(beca)
     participante(pid)["estado"] = "Activa"
     registrar_log("Asignación de beca", f"Se otorgó beca a {participante(pid)['nombre']} por '{motivo}'.")
 
 
 def revocar_beca(pid: int, motivo: str) -> None:
+    s = st.session_state
     b = beca_actual(pid)
-    b["estado"], b["motivo_revocacion"], b["fecha_revocacion"] = "Revocada", motivo, hoy()
+    if b is None:
+        raise RuntimeError("No existe una asignación formal de beca para revocar.")
+    revocada = revocar_beca_db(cliente_supabase(), b["id"], motivo, hoy())
+    s.becas = [revocada if registro["id"] == b["id"] else registro for registro in s.becas]
     participante(pid)["estado"] = "Beca revocada"
     registrar_log("Revocación de beca", f"Se revocó la beca a {participante(pid)['nombre']}. Motivo: {motivo}")
 
@@ -761,7 +856,8 @@ def pct_actividades(acts: list[dict], participantes: list[dict]) -> int | None:
 
 def asistencia_promedio() -> int:
     vals = [v for v in (pct_asistencia(p["id"], st.session_state.actividades)
-                        for p in st.session_state.participantes if p["estado"] == "Activa") if v is not None]
+                        for p in st.session_state.participantes
+                        if estado_participante(p["estado"], estado_pago(p)) == "Activa") if v is not None]
     return round(sum(vals) / len(vals)) if vals else 0
 
 
@@ -770,7 +866,7 @@ def csv_asistencia(acts: list[dict]) -> bytes:
     for a in sorted(acts, key=lambda x: x["fecha"]):
         for p in st.session_state.participantes:
             m = marca(a["id"], p["id"])
-            if m != "sin marcar" or p["estado"] == "Activa":
+            if m != "sin marcar" or estado_participante(p["estado"], estado_pago(p)) == "Activa":
                 filas.append([fecha_txt(a["fecha"]), a["tipo"], a["nombre"], a["modalidad"], p["nombre"], p["rol"],
                               {"presente": "Presente", "ausente": "Ausente", "sin marcar": "Sin marcar"}[m]])
     return a_csv(["Fecha", "Tipo", "Actividad", "Modalidad", "Participante", "Rol", "Asistencia"], filas)
@@ -780,24 +876,36 @@ def csv_asistencia(acts: list[dict]) -> bytes:
 @st.dialog("Registrar pago", width="large")
 def dialogo_pago() -> None:
     elegibles = [p for p in st.session_state.participantes if estado_pago(p) != "Becado (exento)"]
+    if not elegibles:
+        st.info("No hay participantes disponibles para registrar un pago.")
+        return
     opciones = {f"{p['nombre']} · {p['rol']}": p["id"] for p in elegibles}
     sel = st.selectbox("Participante", list(opciones))
     c1, c2 = st.columns(2)
-    monto = c1.number_input("Monto ($)", min_value=0, step=1000, value=PRECIO_DEMO)
+    monto = c1.number_input("Monto ($)", min_value=1, step=1000, value=PRECIO_DEMO, format="%d")
     metodo = c2.selectbox("Método de pago", ["Transferencia", "PayPal", "Voucher"])
     c3, c4 = st.columns(2)
     fecha = c3.date_input("Fecha de pago", value=hoy(), format="DD/MM/YYYY")
     meses = c4.selectbox("Duración de la membresía (meses)", [1, 3, 6, 12], index=2)
-    archivo = st.file_uploader("Comprobante o voucher (imagen o PDF)", type=["png", "jpg", "jpeg", "pdf"])
+    obligatorio = metodo == "Transferencia"
+    archivo = st.file_uploader(
+        "Comprobante de pago" if obligatorio else "Comprobante de pago (opcional)",
+        type=["png", "jpg", "jpeg", "pdf"],
+        help="Para transferencias bancarias es obligatorio adjuntar el comprobante.",
+    )
     if st.button("Guardar pago", key="btn_guardar_pago"):
-        if monto <= 0:
-            st.error("El monto debe ser mayor que 0.")
-        elif archivo is None:
-            st.error("Sube el comprobante como evidencia del pago.")
+        if obligatorio and archivo is None:
+            st.error("Adjunta el comprobante de la transferencia para continuar.")
         else:
-            registrar_pago(opciones[sel], int(monto), metodo, fecha, int(meses), archivo)
-            st.session_state.flash = f"Pago registrado para {sel.split(' · ')[0]}."
-            st.rerun()
+            try:
+                registrar_pago(opciones[sel], int(monto), metodo, fecha, int(meses), archivo)
+            except Exception as exc:
+                st.error(f"No se pudo registrar el pago en Supabase: {exc}")
+            else:
+                st.session_state.pagos_db_ok = True
+                st.session_state.pagos_db_error = None
+                st.session_state.flash = f"Pago registrado para {sel.split(' · ')[0]}."
+                st.rerun()
 
 
 @st.dialog("Registrar donación", width="large")
@@ -813,9 +921,13 @@ def dialogo_donacion() -> None:
         elif monto <= 0:
             st.error("El monto debe ser mayor que 0.")
         else:
-            registrar_donacion(donante.strip(), int(monto), fecha, archivo)
-            st.session_state.flash = f"Donación registrada de {donante}."
-            st.rerun()
+            try:
+                registrar_donacion(donante.strip(), int(monto), fecha, archivo)
+            except Exception as exc:
+                st.error(f"No se pudo guardar la donación en Supabase: {exc}")
+            else:
+                st.session_state.flash = f"Donación registrada de {donante}."
+                st.rerun()
 
 
 def mostrar_archivo(nombre: str, datos: bytes, etiqueta: str) -> None:
@@ -832,21 +944,31 @@ def dialogo_ver(pid: int) -> None:
         st.info("Esta participante no tiene comprobante cargado.")
         return
     st.caption(f"{participante(pid)['nombre']} · {fecha_txt(c['fecha'])} · {plata(c['monto'])} · {c['metodo']}")
-    mostrar_archivo(c["comprobante_nombre"], c["comprobante"], "Descargar comprobante")
+    try:
+        contenido = descargar_comprobante(cliente_supabase(), SUPABASE_PAYMENTS_BUCKET, c["comprobante_url"])
+    except Exception as exc:
+        st.error(f"No se pudo descargar el comprobante desde Storage: {exc}")
+        return
+    mostrar_archivo(c["comprobante_nombre"], contenido, "Descargar comprobante")
 
 
 @st.dialog("Historial financiero", width="large")
 def dialogo_historial_fin() -> None:
     tabs = st.tabs(["Membresías", "Donaciones"])
     with tabs[0]:
-        hist = sorted(st.session_state.pagos, key=lambda x: (x["fecha"], x["id"]), reverse=True)
+        hist = sorted(
+            st.session_state.pagos,
+            key=lambda x: (x["fecha"], str(x.get("creado_en") or ""), str(x["id"])),
+            reverse=True,
+        )
         html(tabla_html(["Fecha", "Participante", "Monto", "Método", "Comprobante"],
                         [[fecha_txt(x["fecha"]), escape(participante(x["participante_id"])["nombre"]), plata(x["monto"]),
-                          escape(x["metodo"]), "Sí" if x["comprobante"] else "—"] for x in hist]))
+                          escape(x["metodo"]), "Sí" if x["comprobante_url"] else "—"] for x in hist]))
     with tabs[1]:
         dones = sorted(st.session_state.donaciones, key=lambda x: x["fecha"], reverse=True)
         html(tabla_html(["Fecha", "Donante", "Monto", "Comprobante"],
-                        [[fecha_txt(x["fecha"]), escape(x["donante"]), plata(x["monto"]), "Sí" if x["comprobante"] else "—"]
+                        [[fecha_txt(x["fecha"]), escape(x["donante"]), plata(x["monto"]),
+                          "Sí" if x["comprobante_url"] else "—"]
                          for x in dones]))
 
 
@@ -902,9 +1024,13 @@ def dialogo_revocar(pid: int) -> None:
         if not motivo.strip():
             st.error("Indica el motivo para dejar registro.")
         else:
-            revocar_beca(pid, motivo.strip())
-            st.session_state.flash = f"Beca revocada a {participante(pid)['nombre']}."
-            st.rerun()
+            try:
+                revocar_beca(pid, motivo.strip())
+            except Exception as exc:
+                st.error(f"No se pudo revocar la beca en Supabase: {exc}")
+            else:
+                st.session_state.flash = f"Beca revocada a {participante(pid)['nombre']}."
+                st.rerun()
 
 
 @st.dialog("Renovar beca")
@@ -917,9 +1043,13 @@ def dialogo_renovar(pid: int) -> None:
         if termino <= inicio:
             st.error("El término debe ser posterior al inicio.")
         else:
-            asignar_beca(pid, "Renovación de beca", inicio, termino)
-            st.session_state.flash = f"Beca renovada a {participante(pid)['nombre']}."
-            st.rerun()
+            try:
+                asignar_beca(pid, "Renovación de beca", inicio, termino)
+            except Exception as exc:
+                st.error(f"No se pudo renovar la beca en Supabase: {exc}")
+            else:
+                st.session_state.flash = f"Beca renovada a {participante(pid)['nombre']}."
+                st.rerun()
 
 
 # ─────────────────────────────────── PÁGINAS ─────────────────────────────────
@@ -927,17 +1057,28 @@ def pagina_panel() -> None:
     h = hoy()
     s = st.session_state
     P, filas = s.participantes, filas_pagos()
-    activas = sum(p["estado"] == "Activa" for p in P)
+    activas = sum(estado_participante(p["estado"], estado_pago(p)) == "Activa" for p in P)
     alerta = [f for f in filas if f["vence"] and f["estado"] != "Becado (exento)" and 0 <= (f["vence"] - h).days <= DIAS_ALERTA]
     vencidas = [f for f in filas if f["estado"] == "Vencido"]
-    ultimas = [b for b in (beca_actual(p["id"]) for p in P) if b]
-    becas_act = sum(estado_beca(b) == "Activa" for b in ultimas)
-    becas_rev = sum(b["estado"] == "Revocada" for b in ultimas)
+    ultimas = [(p, beca_actual(p["id"])) for p in P]
+    becas_act = sum(beca_vigente(p, b, h) for p, b in ultimas)
+    becas_rev = sum(bool(b and b["estado"] == "Revocada") for _, b in ultimas)
     k = (h.year, h.month)
     ing_mes, don_mes = total_mes(s.pagos, k), total_mes(s.donaciones, k)
 
     hero("Panel general", f"¡Hola, {NOMBRE_USUARIA}!", "Resumen de participantes, membresías e ingresos de la fundación.",
          [("Participantes activas", activas), ("Por vencer", len(alerta)), ("Vencidas", len(vencidas))])
+    if not s.donaciones_db_ok:
+        st.warning(f"No se pudieron cargar las donaciones de Supabase: {s.donaciones_db_error}")
+        if st.button("Reintentar carga de donaciones", key="btn_reintentar_donaciones"):
+            try:
+                s.donaciones = cargar_donaciones_db(cliente_supabase())
+            except Exception as exc:
+                s.donaciones_db_error = str(exc)
+                st.error(f"La conexión de donaciones sigue fallando: {exc}")
+            else:
+                s.donaciones_db_ok, s.donaciones_db_error = True, None
+                st.rerun()
 
     metricas = [
         ("users", "Participantes activas", str(activas), f"de {len(P)} registradas"),
@@ -994,6 +1135,17 @@ def pagina_registro() -> None:
             "Carta de compromiso (obligatoria para mentoras)" if es_mentora else "Carta de compromiso (opcional)",
             type=CARTA_TIPOS, key=f"f_carta_{s.carta_n}",
             help="Puedes subirla ahora o después desde la lista de participantes.")
+        if s.get("f_rol") == "Becada":
+            st.markdown("**Asignación de beca**")
+            st.text_input("Motivo de la beca", placeholder="Describe el motivo", key="f_beca_motivo")
+            c1, c2 = st.columns(2)
+            c1.date_input("Inicio de vigencia", value=hoy(), format="DD/MM/YYYY", key="f_beca_inicio")
+            c2.date_input(
+                "Término de vigencia", value=sumar_meses(hoy(), 6),
+                format="DD/MM/YYYY", key="f_beca_termino",
+            )
+            if not s.get("becas_db_ok", False):
+                st.warning("Primero ejecuta la migración de Becas en Supabase; la aplicación no guardará una becada sin registrar su vigencia.")
         st.button("Guardar participante", key="btn_guardar_part", on_click=guardar_participante)
         msg = s.pop("f_msg", None)
         if msg:
@@ -1021,8 +1173,8 @@ def pagina_registro() -> None:
             td(cols[0], escape(p["nombre"]))
             td(cols[1], escape(p["correo"]))
             td(cols[2], escape(p.get("pais", "Chile")))
-            td(cols[3], f'<span class="chip">{escape(p["rol"])}</span>')
-            td(cols[4], escape(p["estado"]))
+            td(cols[3], chip(p["rol"]))
+            td(cols[4], escape(estado_participante(p["estado"], estado_pago(p))))
             if p["carta"]:
                 if cols[5].button("Ver carta", key=f"mini_carta_{p['id']}"):
                     dialogo_ver_carta(p["id"])
@@ -1036,21 +1188,38 @@ def pagina_registro() -> None:
 def pagina_pagos() -> None:
     s = st.session_state
     h = hoy()
-    filas = filas_pagos()
+    filas = filas_pagos() if s.pagos_db_ok else []
     k = (h.year, h.month)
     hero("Finanzas", "Membresías, pagos y donaciones", "Control de vigencias, comprobantes y aportes recibidos.",
          [("Ingresos del mes", plata(total_mes(s.pagos, k))), ("Donaciones del mes", plata(total_mes(s.donaciones, k)))])
 
+    if not s.pagos_db_ok:
+        st.error(f"No se pudo cargar el historial de pagos desde Supabase: {s.pagos_db_error}")
+        if st.button("Reintentar conexión de pagos", key="btn_reintentar_pagos"):
+            try:
+                s.pagos = cargar_pagos_db(cliente_supabase())
+                s.membresias = crear_membresias(s.pagos)
+            except Exception as exc:
+                s.pagos_db_error = str(exc)
+                st.error(f"La conexión sigue fallando: {exc}")
+            else:
+                s.pagos_db_ok, s.pagos_db_error = True, None
+                st.rerun()
+
     b1, b2, b3, _ = st.columns([1, 1, 1.1, 2])
-    if b1.button("+ Registrar pago", key="btn_nuevo_pago", width="stretch"):
+    if b1.button("+ Registrar pago", key="btn_nuevo_pago", width="stretch", disabled=not s.pagos_db_ok):
         dialogo_pago()
-    if b2.button("+ Registrar donación", key="btn_nueva_donacion", width="stretch"):
+    if b2.button(
+        "+ Registrar donación", key="btn_nueva_donacion", width="stretch",
+        disabled=not s.donaciones_db_ok,
+    ):
         dialogo_donacion()
-    if b3.button("Historial financiero", key="btn_hist_fin", width="stretch"):
+    if b3.button("Historial financiero", key="btn_hist_fin", width="stretch", disabled=not s.pagos_db_ok):
         dialogo_historial_fin()
 
     cuenta = {e: sum(f["estado"] == e for f in filas) for e in ESTADOS}
-    for col, m in zip(st.columns(4), [("check", "Al día", str(cuenta["Pagado"]), "membresías vigentes"),
+    for col, m in zip(st.columns(5), [("clock", "Pendientes", str(cuenta["Pendiente"]), "sin pagos registrados"),
+                                      ("check", "Al día", str(cuenta["Pagado"]), "membresías vigentes"),
                                       ("clock", "Por vencer", str(cuenta["Por vencer"]), f"vencen en {DIAS_ALERTA} días o menos"),
                                       ("alert", "Vencidas", str(cuenta["Vencido"]), "requieren seguimiento"),
                                       ("award", "Becadas (exentas)", str(cuenta["Becado (exento)"]), "no pagan membresía")]):
@@ -1068,7 +1237,7 @@ def pagina_pagos() -> None:
             p = f["p"]
             cols = st.columns(anchos, vertical_alignment="center")
             td(cols[0], escape(p["nombre"]))
-            td(cols[1], f'<span class="chip">{escape(p["rol"])}</span>')
+            td(cols[1], chip(p["rol"]))
             td(cols[2], fecha_txt(f["inicio"]))
             td(cols[3], fecha_txt(f["vence"]))
             td(cols[4], chip(f["estado"]))
@@ -1078,6 +1247,8 @@ def pagina_pagos() -> None:
             else:
                 td(cols[5], "—")
             sep()
+        if not filas:
+            st.caption("Aún no hay pagos registrados para mostrar.")
 
 
 def pagina_asistencia() -> None:
@@ -1108,7 +1279,7 @@ def pagina_asistencia() -> None:
         for p in s.participantes:
             cols = st.columns(widths, vertical_alignment="center")
             celda(cols[0], f'<div style="font-weight:700;padding:6px 0;font-size:14px">{escape(p["nombre"])}'
-                           f'<div class="muted" style="font-weight:400">{escape(p["rol"])} · {escape(p.get("pais", "Chile"))}</div></div>')
+                           f'<div class="muted" style="font-weight:400">{chip(p["rol"])} · {escape(p.get("pais", "Chile"))}</div></div>')
             for col, a in zip(cols[1:], visibles):
                 m = marca(a["id"], p["id"])
                 pref, lbl = {"presente": ("attp", "✓"), "ausente": ("atta", "✕"), "sin marcar": ("attn", "\u00a0")}[m]
@@ -1122,6 +1293,9 @@ def pagina_asistencia() -> None:
 
 
 def formulario_beca() -> None:
+    if not st.session_state.get("becas_db_ok", False):
+        st.warning("No se pueden registrar becas hasta que la tabla Becas esté disponible en Supabase.")
+        return
     n = st.session_state.beca_n
     con_beca = {b["participante_id"] for b in st.session_state.becas if estado_beca(b) == "Activa"}
     elegibles = [p["id"] for p in st.session_state.participantes if p["id"] not in con_beca]
@@ -1137,19 +1311,35 @@ def formulario_beca() -> None:
         elif termino <= inicio:
             st.error("El término debe ser posterior al inicio.")
         else:
-            asignar_beca(pid, motivo.strip(), inicio, termino)
-            st.session_state.beca_n += 1
-            st.session_state.flash = f"Beca asignada a {participante(pid)['nombre']}."
-            st.rerun()
+            try:
+                asignar_beca(pid, motivo.strip(), inicio, termino)
+            except Exception as exc:
+                st.error(f"No se pudo guardar la beca en Supabase: {exc}")
+            else:
+                st.session_state.beca_n += 1
+                st.session_state.flash = f"Beca asignada a {participante(pid)['nombre']}."
+                st.rerun()
 
 
 def pagina_becas() -> None:
     s = st.session_state
-    registros = [(p, beca_actual(p["id"])) for p in s.participantes]
-    registros = sorted([(p, b) for p, b in registros if b], key=lambda x: (estado_beca(x[1]) != "Activa", x[0]["id"]))
-    activas = sum(estado_beca(b) == "Activa" for _, b in registros)
+    registros = becas_para_listado(s.participantes, s.becas)
+    registros.sort(key=lambda x: (not beca_vigente(x[0], x[1], hoy()), x[0]["id"]))
+    activas = sum(beca_vigente(p, b, hoy()) for p, b in registros)
     hero("Becas", "Gestión de becas", "Asignación, vigencia y seguimiento de asistencia de las becadas.",
          [("Becas activas", activas), ("Inactivas", len(registros) - activas)])
+    if not s.becas_db_ok:
+        st.error(f"No se pudieron cargar las asignaciones de beca desde Supabase: {s.becas_db_error}")
+        st.caption("Ejecuta la migración `supabase/migrations/20261113000000_create_becas.sql` en el SQL Editor de Supabase.")
+        if st.button("Reintentar conexión de becas", key="btn_reintentar_becas"):
+            try:
+                s.becas = cargar_becas_db(cliente_supabase())
+            except Exception as exc:
+                s.becas_db_error = str(exc)
+                st.error(f"La conexión sigue fallando: {exc}")
+            else:
+                s.becas_db_ok, s.becas_db_error = True, None
+                st.rerun()
 
     izq, der = st.columns([2.15, 1])
     with izq, st.container(key="card_becas_tabla"):
@@ -1159,22 +1349,33 @@ def pagina_becas() -> None:
         if not registros:
             st.caption("Todavía no hay becas registradas.")
         for p, b in registros:
-            est = estado_beca(b)
-            hasta = min(b["termino"], hoy())
-            pct = pct_asistencia(p["id"], [a for a in s.actividades if b["inicio"] <= a["fecha"] <= hasta])
+            if b is None:
+                est = "Becado (exento)"
+                asignacion = "Por rol"
+                vigencia = "Sin período formal"
+            else:
+                est = estado_beca(b)
+                asignacion = fecha_corta(b["asignacion"])
+                vigencia = f'{fecha_corta(b["inicio"])} – {fecha_corta(b["termino"])}'
+            actividades_beca = actividades_de_beca(s.actividades, b, hoy())
+            pct = pct_asistencia(p["id"], actividades_beca)
             cols = st.columns(anchos, vertical_alignment="center")
             td(cols[0], escape(p["nombre"]))
-            td(cols[1], fecha_corta(b["asignacion"]), "nw")
-            td(cols[2], f'{fecha_corta(b["inicio"])} – {fecha_corta(b["termino"])}', "nw")
+            td(cols[1], asignacion, "nw")
+            td(cols[2], vigencia, "nw")
             celda(cols[3], f'<div class="td">{barra(pct)}</div>')
             td(cols[4], chip(est))
-            if est == "Activa":
+            if b is None:
+                td(cols[5], "Sin registro formal")
+            elif est == "Activa":
                 if cols[5].button("Revocar", key=f"mini_rev_{p['id']}"):
                     dialogo_revocar(p["id"])
             elif cols[5].button("Renovar", key=f"mini_ren_{p['id']}", help=detalle_inactiva(b)):
                 dialogo_renovar(p["id"])
             sep()
-        st.caption("«Inactiva»: beca revocada o con la vigencia terminada. El % de asistencia se mide dentro de la vigencia.")
+        if any(b is None for _, b in registros):
+            st.info("Sin asignación formal se muestra la asistencia histórica sobre todas las actividades; con período formal, se calcula solo dentro de la vigencia.")
+        st.caption("«Inactiva»: beca revocada o con la vigencia terminada. «Sin datos» indica que no hay asistencias marcadas para ese período.")
     with der, st.container(key="card_becas_form"):
         html('<div class="sub">Asignar nueva beca</div><div class="muted">Para revocar o renovar usa los botones de la tabla.</div>')
         formulario_beca()
@@ -1209,8 +1410,8 @@ def pagina_seguimiento() -> None:
             marcadas = sum(marca(a["id"], p["id"]) != "sin marcar" for a in acts)
             cols = st.columns(anchos, vertical_alignment="center")
             td(cols[0], escape(p["nombre"]))
-            td(cols[1], f'<span class="chip">{escape(p["rol"])}</span>')
-            td(cols[2], escape(p["estado"]))
+            td(cols[1], chip(p["rol"]))
+            td(cols[2], escape(estado_participante(p["estado"], estado_pago(p))))
             td(cols[3], f"{marcadas} de {len(acts)}")
             celda(cols[4], f'<div class="td">{barra(pcts[p["id"]])}</div>')
             td(cols[5], nivel_chip(pcts[p["id"]]))
@@ -1222,7 +1423,7 @@ def pagina_reportes() -> None:
     h = hoy()
     P = s.participantes
     k = (h.year, h.month)
-    activas = [p for p in P if p["estado"] == "Activa"]
+    activas = [p for p in P if estado_participante(p["estado"], estado_pago(p)) == "Activa"]
     hero("Reportes", "Resumen rápido", "Indicadores clave del mes. El análisis completo está en Data Studio.")
 
     for col, m in zip(st.columns(4), [
@@ -1288,6 +1489,67 @@ def pagina_historial() -> None:
 
 
 # ─────────────────────────────── NAVEGACIÓN Y MAIN ───────────────────────────
+def pagina_acceso() -> None:
+    hero("Acceso seguro", "Bienvenida", "Inicia sesión con la cuenta autorizada de tu equipo.")
+    aviso = st.session_state.pop("auth_notice", None)
+    if aviso:
+        st.warning(aviso)
+
+    if not supabase_url or not supabase_key:
+        st.error("Faltan SUPABASE_URL o SUPABASE_KEY en el archivo .env.")
+        return
+
+    with st.container(key="card_login"):
+        html('<div class="sub">Iniciar sesión</div>'
+             '<div class="muted">Las cuentas deben estar creadas y confirmadas en Supabase Auth.</div>')
+        with st.form("form_acceso"):
+            correo = st.text_input("Correo electrónico", key="login_correo", autocomplete="email")
+            contrasena = st.text_input("Contraseña", type="password", key="login_contrasena",
+                                       autocomplete="current-password")
+            ingresar = st.form_submit_button("Ingresar", width="stretch")
+
+    if not ingresar:
+        return
+
+    try:
+        cliente = iniciar_sesion_supabase(supabase_url, supabase_key, correo, contrasena)
+    except ValueError as exc:
+        st.error(str(exc))
+    except AuthApiError:
+        st.error("No se pudo iniciar sesión. Revisa las credenciales y confirma que la cuenta esté habilitada.")
+    except (HTTPError, SupabaseException) as exc:
+        detalle = str(exc)
+        for secreto in (supabase_url, supabase_key):
+            if secreto:
+                detalle = detalle.replace(secreto, "[oculto]")
+        st.error(f"No se pudo conectar con Supabase Auth ({type(exc).__name__}): {detalle}")
+    except RuntimeError as exc:
+        st.error(f"No se pudo iniciar la sesión: {exc}")
+    else:
+        st.session_state["_cliente_supabase"] = cliente
+        st.session_state["usuario_email"] = correo.strip()
+        st.session_state.pop("login_contrasena", None)
+        st.rerun()
+
+
+def cerrar_sesion() -> None:
+    cliente = st.session_state.get("_cliente_supabase")
+    aviso = None
+    if isinstance(cliente, Client):
+        try:
+            cliente.auth.sign_out()
+        except (AuthApiError, HTTPError, SupabaseException) as exc:
+            aviso = f"La sesión local se cerró, pero Supabase no confirmó el cierre ({type(exc).__name__})."
+
+    st.session_state.clear()
+    if aviso:
+        st.session_state["auth_notice"] = aviso
+
+
+if not isinstance(st.session_state.get("_cliente_supabase"), Client):
+    pagina_acceso()
+    st.stop()
+
 iniciar_datos()
 st.session_state.setdefault("pagina", "Panel")
 st.session_state.setdefault("carta_n", 0)
@@ -1307,8 +1569,10 @@ with st.sidebar:
             activa = st.session_state.pagina == nombre
             st.button(nombre, key=f"{'navon' if activa else 'nav'}_{nombre}", icon=f":material/{icono_nav}:",
                       on_click=ir, args=(nombre,), width="stretch")
-    iniciales = "".join(w[0] for w in NOMBRE_USUARIA.strip("[]").split()[:2]).upper() or "CC"
-    html(f'<div class="user-card"><div class="av">{escape(iniciales)}</div><div><b>{escape(NOMBRE_USUARIA)}</b><span>Coordinación</span></div></div>')
+    usuario = st.session_state.get("usuario_email", NOMBRE_USUARIA)
+    iniciales = "".join(w[0] for w in usuario.strip("[]").split()[:2]).upper() or "CC"
+    html(f'<div class="user-card"><div class="av">{escape(iniciales)}</div><div><b>{escape(usuario)}</b><span>Sesión autorizada</span></div></div>')
+    st.button("Cerrar sesión", key="btn_logout", width="stretch", on_click=cerrar_sesion)
 
 if "flash" in st.session_state:
     st.toast(st.session_state.pop("flash"))

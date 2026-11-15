@@ -13,9 +13,25 @@ participantes, el control de cobros, la asistencia.
 
 ## Instalación
 
-1. Clonar el repositorio
-2. Instalar dependencias
-3. Ejecutar el proyecto
+Desde la carpeta del proyecto, instala las dependencias y ejecuta la aplicación:
+
+```powershell
+python -m pip install -r requirements.txt
+python -m streamlit run .\src\lineacodigo.py
+```
+
+Si prefieres usar un entorno virtual, créalo y actívalo antes de instalar las
+dependencias. El directorio `.venv` es local y no se comparte por GitHub.
+
+### Opcional: pruebas para desarrollo
+
+Este paso no es necesario para abrir la aplicación. Las pruebas comprueban
+algunos casos de pagos, autenticación y becas usando datos simulados; no agregan
+funciones visibles en la página ni modifican Supabase.
+
+```powershell
+python -m unittest discover -s tests -v
+```
 
 ## Tecnologías Utilizadas
 
@@ -23,6 +39,50 @@ participantes, el control de cobros, la asistencia.
 - **Backend:** (Python)
 - **Base de datos:** (MySQL, SupaBase)
 - **Control de versiones:** Git y GitHub
+
+## Pagos y comprobantes
+
+Los pagos se guardan en la tabla `Pagos` de Supabase y los comprobantes en un
+bucket **privado** de Supabase Storage. Configura en `.env`:
+
+```env
+SUPABASE_URL=...
+SUPABASE_KEY=...
+SUPABASE_PAYMENTS_BUCKET=comprobantes-pagos
+```
+
+El bucket debe existir y permitir a la aplicación subir y descargar archivos
+con las políticas de Storage correspondientes. El campo `comprobante_url` de
+`Pagos` guarda la ruta del objeto, no un enlace público. Las transferencias
+bancarias requieren comprobante; otros métodos lo permiten de forma opcional.
+
+La aplicación solicita inicio de sesión con Supabase Auth. Crea y confirma las
+cuentas autorizadas desde **Authentication → Users** en Supabase; no hay
+registro público desde la aplicación. Las políticas del bucket privado deben
+aplicarse a `authenticated`. No habilites acceso público para los comprobantes.
+
+El estado visible de una participante se deriva de su membresía vigente o de
+una beca exenta, por lo que un valor antiguo como `Pendiente de pago` no oculta
+un pago que ya está registrado.
+
+Las donaciones se cargan y guardan en la tabla existente `Donaciones`. Sus
+comprobantes opcionales se almacenan en el bucket privado configurado para
+pagos. El panel suma las donaciones por fecha del registro.
+
+## Becas
+
+Las participantes cuyo rol en `Participantes` sea `Becada` aparecen en Gestión
+de becas y tienen el estado de pago `Becado (exento)`. Al registrar una nueva
+becada, el formulario solicita motivo e inicio y término de vigencia. Estos
+datos, además de asignaciones, renovaciones y revocaciones, se guardan en la
+tabla `Becas`.
+
+Antes de usar la gestión de becas, ejecuta una vez el contenido de
+`supabase/migrations/20261113000000_create_becas.sql` en el SQL Editor de
+Supabase. La migración crea la tabla con permisos RLS para usuarios
+autenticados. Las participantes Becadas antiguas que solo tengan rol, pero no
+una asignación formal, seguirán sin fechas hasta que se les asigne una beca
+desde Gestión de becas.
 
 ## Estructura del Proyecto
 ```bash

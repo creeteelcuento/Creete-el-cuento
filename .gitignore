@@ -3,6 +3,7 @@
 
 # Archivos de Python
 __pycache__/
+.venv/
 *.pyc
 *.pyo
 *.pyd
