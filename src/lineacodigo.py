@@ -1098,8 +1098,8 @@ def pagina_panel() -> None:
                             [("Membresías", [total_mes(s.pagos, m) for m in meses], C_GOLD2),
                              ("Donaciones", [total_mes(s.donaciones, m) for m in meses], C_INK)]))
     with der, st.container(key="card_por_vencer"):
-        html('<div class="sub">Membresías por vencer</div><div class="muted">Próximos 30 días y ya vencidas</div>')
-        prox = sorted([f for f in filas if f["vence"] and f["estado"] != "Becado (exento)" and (f["vence"] - h).days <= 30],
+        html(f'<div class="sub">Membresías por vencer</div><div class="muted">Próximos {DIAS_ALERTA} días y ya vencidas</div>')
+        prox = sorted([f for f in filas if f["vence"] and f["estado"] != "Becado (exento)" and (f["vence"] - h).days <= DIAS_ALERTA],
                       key=lambda f: f["vence"])
         if not prox:
             st.caption("No hay vencimientos próximos.")
