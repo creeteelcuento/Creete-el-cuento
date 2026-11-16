@@ -118,3 +118,18 @@ Creete-el-cuento/
 ## Contribuciones
 
 Las contribuciones son bienvenidas. Cada reunión el cual validará nuestros cambios. Cada uno sube antes a su rama personal antes de la rama main. El cual deberá tener precisión y revisión previa. 
+
+### Publicar la app en Streamlit Community Cloud
+
+Conecta el repositorio y selecciona `src/lineacodigo.py` como archivo principal.
+En **Advanced settings → Secrets**, agrega la configuracion en formato TOML:
+
+```toml
+SUPABASE_URL = "https://tu-proyecto.supabase.co"
+SUPABASE_KEY = "tu_clave_anon_o_publishable"
+SUPABASE_PAYMENTS_BUCKET = "comprobantes-pagos"
+```
+
+La app lee estos valores desde los Secrets de Streamlit Cloud y sigue aceptando
+`.env` en el entorno local. Usa una clave `anon`/`publishable` protegida por
+politicas RLS; nunca publiques `.env` ni uses una clave `service_role`.

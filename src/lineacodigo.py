@@ -19,6 +19,7 @@ from httpx import HTTPError
 from supabase import Client, SupabaseException
 from supabase_auth.errors import AuthApiError
 from dotenv import load_dotenv
+import streamlit as st
 from auth_supabase import iniciar_sesion as iniciar_sesion_supabase
 from becas_estado import actividades_de_beca, beca_vigente, becas_para_listado, fechas_pago
 from becas_supabase import (
@@ -42,10 +43,19 @@ from pagos_supabase import (
 # Cargar variables de entorno
 load_dotenv()
 
+def configuracion(nombre: str, predeterminado: str | None = None) -> str | None:
+    """Lee secretos de Streamlit Cloud o, en local, variables de entorno/.env."""
+    try:
+        valor = st.secrets.get(nombre)
+    except Exception:  # Streamlit lanza un error si no hay secrets.toml local.
+        valor = None
+    return valor or os.environ.get(nombre, predeterminado)
+
+
 # Conectar con Supabase
-supabase_url = os.environ.get("SUPABASE_URL")
-supabase_key = os.environ.get("SUPABASE_KEY")
-SUPABASE_PAYMENTS_BUCKET = os.environ.get("SUPABASE_PAYMENTS_BUCKET", "comprobantes-pagos")
+supabase_url = configuracion("SUPABASE_URL")
+supabase_key = configuracion("SUPABASE_KEY")
+SUPABASE_PAYMENTS_BUCKET = configuracion("SUPABASE_PAYMENTS_BUCKET", "comprobantes-pagos")
 
 from datetime import date, datetime, timedelta
 from html import escape
@@ -57,7 +67,6 @@ try:
 except Exception:  # noqa: BLE001
     TZ = None
 
-import streamlit as st
 
 # ─────────────────────────────── CONFIGURACIÓN ───────────────────────────────
 st.set_page_config(page_title="Créete el Cuento · Gestión", page_icon="💡", layout="wide")
