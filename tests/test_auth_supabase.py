@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
+from httpx import ReadError, Request
 from src.auth_supabase import iniciar_sesion
 
 
@@ -67,6 +69,32 @@ class SupabaseAuthTest(unittest.TestCase):
                 "test-password",
                 crear_cliente,
             )
+
+    def test_reintenta_una_falla_transitoria_de_http(self):
+        class AuthConReintento:
+            def __init__(self):
+                self.llamadas = 0
+
+            def sign_in_with_password(self, credenciales):
+                self.llamadas += 1
+                if self.llamadas == 1:
+                    raise ReadError("transient", request=Request("POST", "https://example.test"))
+                return SimpleNamespace(session=object())
+
+        auth = AuthConReintento()
+        cliente = SimpleNamespace(auth=auth)
+
+        with patch("src.auth_supabase.time.sleep", return_value=None):
+            resultado = iniciar_sesion(
+                "https://example.supabase.co",
+                "publishable-test",
+                "user@example.test",
+                "test-password",
+                lambda url, clave: cliente,
+            )
+
+        self.assertIs(resultado, cliente)
+        self.assertEqual(auth.llamadas, 2)
 
 
 if __name__ == "__main__":

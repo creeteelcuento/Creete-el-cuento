@@ -19,7 +19,7 @@ import uuid
 
 from httpx import HTTPError
 from supabase import Client, SupabaseException
-from supabase_auth.errors import AuthApiError
+from supabase_auth.errors import AuthApiError, AuthRetryableError
 from dotenv import load_dotenv
 import streamlit as st
 from auth_supabase import iniciar_sesion as iniciar_sesion_supabase
@@ -1727,6 +1727,8 @@ def pagina_acceso() -> None:
         st.error(str(exc))
     except AuthApiError:
         st.error("No se pudo iniciar sesión. Revisa las credenciales y confirma que la cuenta esté habilitada.")
+    except AuthRetryableError:
+        st.error("Supabase no respondió a tiempo. Espera unos segundos y vuelve a pulsar Ingresar.")
     except (HTTPError, SupabaseException) as exc:
         detalle = str(exc)
         for secreto in (supabase_url, supabase_key):

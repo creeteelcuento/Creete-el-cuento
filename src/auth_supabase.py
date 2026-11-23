@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import time
 
+from httpx import HTTPError
 from supabase import Client, create_client
+from supabase_auth.errors import AuthRetryableError
 
 
 def iniciar_sesion(
@@ -20,9 +23,15 @@ def iniciar_sesion(
         raise ValueError("Ingresa tu correo y contraseña.")
 
     cliente = crear_cliente(url, clave)
-    respuesta = cliente.auth.sign_in_with_password(
-        {"email": correo.strip(), "password": contrasena}
-    )
+    credenciales = {"email": correo.strip(), "password": contrasena}
+    for intento in range(2):
+        try:
+            respuesta = cliente.auth.sign_in_with_password(credenciales)
+            break
+        except (AuthRetryableError, HTTPError):
+            if intento == 1:
+                raise
+            time.sleep(1)
     if respuesta.session is None:
         raise RuntimeError("Supabase Auth no devolvió una sesión válida.")
     return cliente
