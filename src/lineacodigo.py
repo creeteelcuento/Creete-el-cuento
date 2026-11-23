@@ -12,8 +12,10 @@ from __future__ import annotations
 import base64
 import csv
 import io
+import mimetypes
 import re
 import os
+import uuid
 
 from httpx import HTTPError
 from supabase import Client, SupabaseException
@@ -56,10 +58,11 @@ def configuracion(nombre: str, predeterminado: str | None = None) -> str | None:
 supabase_url = configuracion("SUPABASE_URL")
 supabase_key = configuracion("SUPABASE_KEY")
 SUPABASE_PAYMENTS_BUCKET = configuracion("SUPABASE_PAYMENTS_BUCKET", "comprobantes-pagos")
+SUPABASE_LETTERS_BUCKET = configuracion("SUPABASE_LETTERS_BUCKET", SUPABASE_PAYMENTS_BUCKET)
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from html import escape
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 try:
     from zoneinfo import ZoneInfo
@@ -316,6 +319,21 @@ st.markdown("<style>" + re.sub(r"\s*\n\s*", " ", CSS) + "</style>", unsafe_allow
 def ahora() -> datetime:
     """Fecha y hora actuales en Chile (sin zona, para guardarlas simples)."""
     return (datetime.now(TZ) if TZ else datetime.now()).replace(tzinfo=None)
+
+
+def fecha_hora_local(valor: str | datetime | None) -> datetime | None:
+    """Convierte marcas de tiempo de Supabase (UTC) a la hora local de Chile."""
+    if not valor:
+        return None
+    try:
+        instante = valor if isinstance(valor, datetime) else datetime.fromisoformat(str(valor).replace("Z", "+00:00"))
+        if instante.tzinfo is None:
+            instante = instante.replace(tzinfo=timezone.utc)
+        if TZ:
+            instante = instante.astimezone(TZ)
+        return instante.replace(tzinfo=None)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def hoy() -> date:
@@ -575,7 +593,9 @@ def iniciar_datos() -> None:
             "id": p["id"], "nombre": p["nombre"], "correo": p["correo"],
             "telefono": p.get("telefono", ""), "pais": p.get("pais", "Chile"),
             "rol": p.get("rol", "Emprendedora"), "descripcion": "",
-            "estado": p.get("estado", "Activa"), "carta_nombre": None, "carta": None
+            "estado": p.get("estado", "Activa"), "carta_nombre": None, "carta": None,
+            "creado_en": p.get("created_at") or p.get("creado_en"),
+            "url_carta_compromiso": p.get("url_carta_compromiso"),
         })
     
     # 2. Actividades
@@ -670,14 +690,33 @@ def ultimo_comprobante(pid: int) -> dict | None:
 
 def registrar_pago(pid: int, monto: int, metodo: str, fecha: date, meses: int, archivo=None) -> None:
     s = st.session_state
+    persona = participante(pid)
     pago = guardar_pago_db(
         cliente_supabase(), SUPABASE_PAYMENTS_BUCKET, pid, monto, metodo, fecha, meses, archivo, hoy()
     )
     s.pagos.append(pago)
     s.membresias[pid] = dict(inicio=pago["inicio"], vencimiento=pago["vencimiento"])
     participante(pid)["estado"] = "Activa"
-    registrar_log("Registro de pago", f"Se registró pago de {plata(monto)} para {participante(pid)['nombre']}.",
-                  archivo.name if archivo else None)
+    detalle = f"Se registró pago de {plata(monto)} para {persona['nombre']}."
+    email_usuario = s.get("usuario_email")
+    if not email_usuario:
+        try:
+            usuario = cliente_supabase().auth.get_user().user
+            email_usuario = getattr(usuario, "email", None)
+        except Exception:
+            email_usuario = None
+    datos_historial = {
+        "usuario_responsable": email_usuario or "sistema@desconocido.com",
+        "tipo_accion": "Registro de pago",
+        "detalle": detalle,
+        # El bucket de comprobantes es privado; se almacena la ruta para descargarlo
+        # de forma autenticada desde el historial.
+        "url_comprobante": pago.get("comprobante_url") or None,
+    }
+    try:
+        cliente_supabase().table("historial_acciones").insert(datos_historial).execute()
+    except Exception as exc:
+        st.warning(f"El pago se guardó, pero no se pudo registrar en historial_acciones: {exc}")
 
 
 def registrar_donacion(donante: str, monto: int, fecha: date, archivo) -> None:
@@ -748,13 +787,23 @@ def guardar_participante() -> None:
             nombre, correo, s.f_tel.strip(), s.f_pais, s.f_rol, estado
         )
         if participante_db:
+            url_carta_compromiso = None
+            if carta is not None:
+                try:
+                    url_carta_compromiso = guardar_carta_participante(
+                        participante_db["id"], carta, nombre_participante=nombre
+                    )
+                except Exception as exc:
+                    st.warning(f"La participante quedó registrada, pero no se pudo guardar su carta: {exc}")
             
             # 2. Si fue exitoso, actualizar también la sesión local para que se vea al instante
             nuevo_id = participante_db["id"]
             s.participantes.append(dict(
                 id=nuevo_id, nombre=nombre, correo=correo, telefono=s.f_tel.strip(),
                 pais=s.f_pais, rol=s.f_rol, descripcion=s.f_desc.strip(), estado=estado,
-                carta_nombre=carta.name if carta else None, carta=carta.getvalue() if carta else None))
+                carta_nombre=carta.name if carta else None, carta=carta.getvalue() if carta else None,
+                creado_en=participante_db.get("created_at") or participante_db.get("creado_en") or ahora().isoformat(),
+                url_carta_compromiso=url_carta_compromiso))
             
             if es_becada:
                 try:
@@ -888,6 +937,26 @@ def dialogo_pago() -> None:
     if not elegibles:
         st.info("No hay participantes disponibles para registrar un pago.")
         return
+    prioridad_estado = {"Pendiente": 0, "Por vencer": 1, "Vencido": 2, "Pagado": 3}
+
+    def clave_orden(p: dict) -> tuple:
+        creado_en = p.get("creado_en")
+        try:
+            timestamp = datetime.fromisoformat(str(creado_en).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError, OverflowError):
+            # Algunas instalaciones de Participantes no tienen created_at;
+            # el ID autoincremental sirve como respaldo para reconocer altas recientes.
+            try:
+                timestamp = float(p["id"])
+            except (TypeError, ValueError, OverflowError):
+                timestamp = 0
+        return (
+            prioridad_estado.get(estado_pago(p), 4),
+            -timestamp,
+            p["nombre"].strip().casefold(),
+        )
+
+    elegibles.sort(key=clave_orden)
     opciones = {f"{p['nombre']} · {p['rol']}": p["id"] for p in elegibles}
     sel = st.selectbox("Participante", list(opciones))
     c1, c2 = st.columns(2)
@@ -946,6 +1015,72 @@ def mostrar_archivo(nombre: str, datos: bytes, etiqueta: str) -> None:
         st.download_button(etiqueta, datos, file_name=nombre)
 
 
+def guardar_carta_participante(pid: int, archivo, nombre_participante: str | None = None) -> str:
+    """Sube una carta al bucket privado, guarda su ruta y registra la acción."""
+    if archivo is None:
+        raise ValueError("Selecciona un archivo.")
+    nombre = PurePosixPath(str(archivo.name).replace("\\", "/")).name
+    extension = PurePosixPath(nombre).suffix.lower()
+    if extension.lstrip(".") not in CARTA_TIPOS:
+        raise ValueError("El tipo de archivo de la carta no está permitido.")
+    nombre_seguro = re.sub(r"[^A-Za-z0-9_.-]+", "-", nombre).strip("-.") or "carta"
+    ruta = f"cartas/{pid}/{uuid.uuid4().hex}_{nombre_seguro}"
+    almacenamiento = cliente_supabase().storage.from_(SUPABASE_LETTERS_BUCKET)
+    almacenamiento.upload(
+        ruta,
+        archivo.getvalue(),
+        file_options={"content-type": archivo.type or mimetypes.guess_type(nombre)[0] or "application/octet-stream",
+                      "upsert": "false"},
+    )
+    try:
+        respuesta = cliente_supabase().table("Participantes").update(
+            {"url_carta_compromiso": ruta}
+        ).eq("id", pid).select("id").execute()
+        if not respuesta.data:
+            raise RuntimeError("Supabase no confirmó la actualización de la participante.")
+    except Exception:
+        try:
+            almacenamiento.remove([ruta])
+        except Exception:
+            pass
+        raise
+
+    p = next((x for x in st.session_state.participantes if x["id"] == pid), None)
+    if p is not None:
+        p["url_carta_compromiso"] = ruta
+        p["carta_nombre"] = nombre
+        p["carta"] = archivo.getvalue()
+    st.session_state.setdefault("cartas_inaccesibles", set()).discard(pid)
+    nombre_participante = p["nombre"] if p else (nombre_participante or f"participante {pid}")
+    usuario_email = st.session_state.get("usuario_email")
+    if not usuario_email:
+        try:
+            usuario_email = getattr(cliente_supabase().auth.get_user().user, "email", None)
+        except Exception:
+            usuario_email = None
+    try:
+        cliente_supabase().table("historial_acciones").insert({
+            "usuario_responsable": usuario_email or "sistema@desconocido.com",
+            "tipo_accion": "Subida de Carta de Compromiso",
+            "detalle": f"Se adjuntó carta de compromiso para {nombre_participante}.",
+            "url_comprobante": ruta,
+        }).execute()
+    except Exception as exc:
+        st.warning(f"La carta se guardó, pero no se pudo registrar en historial_acciones: {exc}")
+    return ruta
+
+
+def validar_carta_en_storage(ruta: str) -> bool:
+    """Comprueba en silencio que la ruta de la carta exista en Storage."""
+    if ruta.startswith(("https://", "http://")):
+        return True
+    try:
+        cliente_supabase().storage.from_(SUPABASE_LETTERS_BUCKET).create_signed_url(ruta, 3600)
+        return True
+    except Exception:
+        return False
+
+
 @st.dialog("Comprobante de pago")
 def dialogo_ver(pid: int) -> None:
     c = ultimo_comprobante(pid)
@@ -984,8 +1119,18 @@ def dialogo_historial_fin() -> None:
 @st.dialog("Carta de compromiso")
 def dialogo_ver_carta(pid: int) -> None:
     p = participante(pid)
-    st.caption(f"{p['nombre']} · {p['carta_nombre']}")
-    mostrar_archivo(p["carta_nombre"], p["carta"], "Descargar carta")
+    st.caption(f"{p['nombre']} · {p.get('carta_nombre') or 'Carta de compromiso'}")
+    ruta = p.get("url_carta_compromiso")
+    try:
+        if ruta:
+            contenido = descargar_comprobante(cliente_supabase(), SUPABASE_LETTERS_BUCKET, ruta)
+            nombre = p.get("carta_nombre") or str(ruta).rsplit("/", 1)[-1]
+        else:
+            contenido, nombre = p["carta"], p["carta_nombre"]
+        mostrar_archivo(nombre, contenido, "Descargar carta")
+    except Exception:
+        st.session_state.setdefault("cartas_inaccesibles", set()).add(pid)
+        st.rerun()
 
 
 @st.dialog("Subir carta de compromiso")
@@ -993,14 +1138,12 @@ def dialogo_subir_carta(pid: int) -> None:
     st.caption(participante(pid)["nombre"])
     archivo = st.file_uploader("Imagen o documento", type=CARTA_TIPOS, key=f"carta_dlg_{pid}")
     if st.button("Guardar carta", key=f"btn_carta_{pid}"):
-        if archivo is None:
-            st.error("Selecciona un archivo.")
+        try:
+            guardar_carta_participante(pid, archivo)
+        except Exception as exc:
+            st.error(f"No se pudo guardar la carta de compromiso: {exc}")
         else:
-            p = participante(pid)
-            p["carta_nombre"], p["carta"] = archivo.name, archivo.getvalue()
-            registrar_log("Subida de documento", f"Se cargó la carta de compromiso de {p['nombre']}.",
-                          archivo.name, archivo.getvalue())
-            st.session_state.flash = f"Carta de compromiso guardada para {p['nombre']}."
+            st.session_state.flash = f"Carta de compromiso guardada para {participante(pid)['nombre']}."
             st.rerun()
 
 
@@ -1184,12 +1327,16 @@ def pagina_registro() -> None:
             td(cols[2], escape(p.get("pais", "Chile")))
             td(cols[3], chip(p["rol"]))
             td(cols[4], escape(estado_participante(p["estado"], estado_pago(p))))
-            if p["carta"]:
-                if cols[5].button("Ver carta", key=f"mini_carta_{p['id']}"):
+            ruta_carta = p.get("url_carta_compromiso")
+            carta_accesible = bool(ruta_carta) and p["id"] not in s.get("cartas_inaccesibles", set())
+            if carta_accesible and not validar_carta_en_storage(str(ruta_carta)):
+                s.setdefault("cartas_inaccesibles", set()).add(p["id"])
+                carta_accesible = False
+            if carta_accesible:
+                if cols[5].button("Ver carta de compromiso", key=f"mini_carta_{p['id']}", width="stretch"):
                     dialogo_ver_carta(p["id"])
             else:
-                etiqueta_carta = "Subir carta" if p["rol"] == "Mentora" else "Subir carta (opcional)"
-                if cols[5].button(etiqueta_carta, key=f"mini_subir_{p['id']}"):
+                if cols[5].button("Subir carta de compromiso", key=f"mini_subir_{p['id']}", width="stretch"):
                     dialogo_subir_carta(p["id"])
             sep()
 
@@ -1461,7 +1608,43 @@ def clase_accion(accion: str) -> str:
 
 def pagina_historial() -> None:
     s = st.session_state
-    logs = s.get("historial_logs", [])
+    logs = []
+    error_historial = None
+    try:
+        respuesta = cliente_supabase().table("historial_acciones").select("*").order("created_at", desc=True).execute()
+        for fila in respuesta.data or []:
+            ts = fecha_hora_local(fila.get("created_at")) or ahora()
+            logs.append({
+                "id": fila.get("id", f"db_{len(logs)}"),
+                "ts": ts,
+                "accion": fila.get("tipo_accion") or "Acción",
+                "detalle": fila.get("detalle") or "",
+                "url_comprobante": fila.get("url_comprobante"),
+                "archivo_nombre": None,
+                "archivo_bytes": None,
+            })
+    except Exception as exc:
+        error_historial = str(exc)
+
+    # Conserva a la vista pagos previos a la creación de historial_acciones.
+    detalles_db = {x["detalle"] for x in logs if x["accion"] == "Registro de pago"}
+    for pago in s.get("pagos", []):
+        try:
+            nombre = participante(pago["participante_id"])["nombre"]
+        except (StopIteration, KeyError):
+            nombre = f"participante {pago.get('participante_id', '')}"
+        detalle = f"Se registró pago de {plata(pago['monto'])} para {nombre}."
+        if detalle in detalles_db:
+            continue
+        ts = fecha_hora_local(pago.get("creado_en")) or datetime.combine(pago["fecha"], datetime.min.time())
+        logs.append({
+            "id": f"pago_{pago['id']}", "ts": ts, "accion": "Registro de pago",
+            "detalle": detalle, "url_comprobante": pago.get("comprobante_url"),
+            "archivo_nombre": None, "archivo_bytes": None,
+        })
+
+    logs.extend(x for x in s.get("historial_logs", []) if x.get("accion") != "Registro de pago")
+    logs.sort(key=lambda x: x["ts"], reverse=True)
     h = hoy()
     hero("Auditoría", "Historial de acciones", "Registro cronológico de lo que hace el equipo, con respaldos descargables.",
          [("Acciones registradas", len(logs)), ("Hoy", sum(x["ts"].date() == h for x in logs))])
@@ -1477,10 +1660,13 @@ def pagina_historial() -> None:
 
     vistos = [x for x in logs if (tipo == "Todas las acciones" or x["accion"] == tipo) and (not q or q.lower() in x["detalle"].lower())][:100]
     with st.container(key="card_hist"):
+        if error_historial:
+            st.warning(f"No se pudo cargar historial_acciones desde Supabase: {error_historial}")
         if not vistos:
             st.info("No hay acciones que coincidan con el filtro.")
         dia_actual = None
-        for x in vistos:
+        for indice, x in enumerate(vistos):
+            clave_archivo = f"dl_hist_{x['id']}_{indice}"
             d = x["ts"].date()
             if d != dia_actual:
                 dia_actual = d
@@ -1490,8 +1676,23 @@ def pagina_historial() -> None:
             td(c1, f'<b>{x["ts"].strftime("%H:%M")}</b>', "nw")
             td(c2, f'<span class="chip {clase_accion(x["accion"])}">{escape(x["accion"])}</span>')
             td(c3, escape(x["detalle"]))
-            if x["archivo_bytes"] and x["archivo_nombre"]:
-                c4.download_button("Descargar respaldo", x["archivo_bytes"], file_name=x["archivo_nombre"], key=f"dl_log_{x['id']}")
+            if x.get("url_comprobante"):
+                url = str(x["url_comprobante"])
+                if url.startswith(("https://", "http://")):
+                    c4.link_button("Ver comprobante", url, width="stretch")
+                else:
+                    try:
+                        bucket_archivo = (SUPABASE_LETTERS_BUCKET
+                                          if x["accion"] == "Subida de Carta de Compromiso"
+                                          else SUPABASE_PAYMENTS_BUCKET)
+                        datos = descargar_comprobante(cliente_supabase(), bucket_archivo, url)
+                        nombre_archivo = url.rsplit("/", 1)[-1] or "comprobante"
+                        c4.download_button("Descargar respaldo", datos, file_name=nombre_archivo,
+                                           key=clave_archivo, width="stretch")
+                    except Exception as exc:
+                        td(c4, f'<span class="muted">No disponible: {escape(str(exc))}</span>')
+            elif x["archivo_bytes"] and x["archivo_nombre"]:
+                c4.download_button("Descargar respaldo", x["archivo_bytes"], file_name=x["archivo_nombre"], key=clave_archivo)
             else:
                 td(c4, '<span class="muted">Sin archivo</span>')
             sep()
